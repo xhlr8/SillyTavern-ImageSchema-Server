@@ -301,7 +301,7 @@ export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, ma
             }
         }
     }
-    throw new PluginError('Gemini SSE response contained no image', { code: 'invalid_upstream_response' });
+    throw new PluginError('Gemini returned no image; verify that the selected upstream model supports image output', { code: 'invalid_upstream_response' });
 }
 
 export async function genericAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
