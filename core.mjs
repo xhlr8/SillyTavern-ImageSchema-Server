@@ -223,6 +223,55 @@ export async function openAiAdapter(profile, request, { fetchImpl = fetch, maxBy
     throw new PluginError('OpenAI response contained no image', { code: 'invalid_upstream_response' });
 }
 
+function interactionImage(json) {
+    const steps = Array.isArray(json?.steps) ? json.steps : [];
+    for (let stepIndex = steps.length - 1; stepIndex >= 0; stepIndex--) {
+        const content = Array.isArray(steps[stepIndex]?.content) ? steps[stepIndex].content : [];
+        for (let contentIndex = content.length - 1; contentIndex >= 0; contentIndex--) {
+            const item = content[contentIndex];
+            if (typeof item?.data === 'string' && /^image\//i.test(String(item.mime_type ?? item.mimeType ?? ''))) {
+                return { data: item.data, mime: item.mime_type ?? item.mimeType };
+            }
+        }
+    }
+    if (typeof json?.output_image?.data === 'string') return { data: json.output_image.data, mime: json.output_image.mime_type ?? 'image/png' };
+    return null;
+}
+
+function geminiInteractionsUrl(profileUrl) {
+    const url = new URL(profileUrl);
+    if (/\/v1beta\/interactions$/i.test(url.pathname)) return url;
+    let pathname = url.pathname.replace(/\/+$/, '');
+    pathname = pathname.replace(/\/v1beta\/models\/[^/]+:(?:stream)?generateContent$/i, '');
+    url.pathname = `${pathname}/v1beta/interactions`.replace(/\/{2,}/g, '/');
+    url.search = '';
+    return url;
+}
+
+async function geminiInteractionsAdapter(profile, request, options = {}) {
+    const { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = options;
+    const url = geminiInteractionsUrl(profile.url);
+    const headers = { 'content-type': 'application/json', accept: 'application/json', ...(profile.headers ?? {}) };
+    if (profile.apiKey) {
+        if (profile.queryApiKey === true || (profile.queryApiKey === undefined && /(^|\.)generativelanguage\.googleapis\.com$/i.test(url.hostname))) url.searchParams.set('key', profile.apiKey);
+        else if (profile.queryApiKey === false) headers['x-goog-api-key'] ??= profile.apiKey;
+        else headers.authorization ??= `Bearer ${profile.apiKey}`;
+    }
+    let prompt = `Create exactly one image. ${request.prompt}`;
+    if (request.negative) prompt += `\nAvoid: ${request.negative}`;
+    const body = { model: request.model, input: [{ type: 'text', text: prompt }] };
+    const response = await checkedFetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal }, profile, fetchImpl, { diagnostics, scope, profile: profileName });
+    const json = await responseJson(response, maxBytes, 'Gemini Interactions');
+    const image = interactionImage(json);
+    if (!image) {
+        const rejected = String(json?.status ?? '').toLowerCase() === 'failed' || JSON.stringify(json?.steps ?? []).match(/safety|blocked|policy/i);
+        throw new PluginError(rejected ? 'Gemini rejected the prompt' : 'Gemini Interactions response contained no image', { status: rejected ? 400 : 502, code: rejected ? 'safety' : 'invalid_upstream_response' });
+    }
+    const data = Buffer.from(image.data, 'base64');
+    if (data.length > maxBytes) throw new PluginError('Upstream image exceeds configured size limit', { code: 'response_too_large' });
+    return { data, mime: sniffMime(data, image.mime) };
+}
+
 function parseSse(text) {
     const events = [];
     let dataLines = [];
@@ -238,7 +287,11 @@ function parseSse(text) {
     return events;
 }
 
-export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
+export async function geminiSseAdapter(profile, request, options = {}) {
+    if (/^gemini-3(?:\.|-|$)/i.test(String(request.model ?? '')) || /\/v1beta\/interactions$/i.test(new URL(profile.url).pathname)) {
+        return geminiInteractionsAdapter(profile, request, options);
+    }
+    const { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = options;
     const url = new URL(profile.url);
     if (!/:streamGenerateContent$/i.test(url.pathname)) {
         if (!request.model) throw new PluginError('Gemini model is required when using a base URL', { status: 400, code: 'invalid_request' });

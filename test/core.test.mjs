@@ -61,7 +61,24 @@ test('OpenAI adapter sends configured URL and decodes b64_json', async () => {
     assert.equal(body.size, '1536x1024');
 });
 
-test('Gemini SSE adapter reads inline image across standard SSE events', async () => {
+test('Gemini 3 adapter reads image output from the Interactions API', async () => {
+    let captured;
+    const result = await geminiSseAdapter({
+        type: 'gemini-sse', url: 'https://proxy.example.test/google-ai', apiKey: 'secret',
+    }, { prompt: 'cat', width: 512, height: 512, negative: '', model: 'gemini-3.1-flash-image' }, {
+        fetchImpl: async (url, options) => {
+            captured = { url: String(url), body: JSON.parse(options.body), headers: options.headers };
+            return jsonResponse({ steps: [{ content: [] }, { content: [{ type: 'image', mime_type: 'image/png', data: PNG.toString('base64') }] }] });
+        },
+    });
+    assert.equal(result.mime, 'image/png');
+    assert.match(captured.url, /\/google-ai\/v1beta\/interactions$/);
+    assert.equal(captured.body.model, 'gemini-3.1-flash-image');
+    assert.match(captured.body.input[0].text, /Create exactly one image/);
+    assert.equal(captured.headers.authorization, 'Bearer secret');
+});
+
+test('legacy Gemini SSE adapter reads inline image across standard SSE events', async () => {
     const sse = [
         ': keepalive',
         `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'working' }] } }] })}`,
@@ -72,7 +89,7 @@ test('Gemini SSE adapter reads inline image across standard SSE events', async (
     let capturedUrl;
     const result = await geminiSseAdapter({
         type: 'gemini-sse', url: 'https://gemini.example.test/stream', apiKey: 'secret', queryApiKey: true,
-    }, { prompt: 'cat', width: 512, height: 512, negative: '', model: 'gemini-image' }, {
+    }, { prompt: 'cat', width: 512, height: 512, negative: '', model: 'gemini-2.5-flash-image' }, {
         fetchImpl: async url => {
             capturedUrl = String(url);
             return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
