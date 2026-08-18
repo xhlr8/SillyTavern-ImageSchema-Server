@@ -226,7 +226,7 @@ export async function init(router) {
         return sendImage(request, response, result, config);
     }));
 
-    router.get('/status', (_request, response) => response.json({ ok: true, version: '1.1.0', ...profilesPublicView(config) }));
+    router.get('/status', (_request, response) => response.json({ ok: true, version: '1.2.0', ...profilesPublicView(config) }));
     router.get('/profiles', (_request, response) => response.json(profilesPublicView(config)));
     // Compatibility route used by existing clients; it remains read-only despite POST.
     router.post('/profiles', (_request, response) => response.json(profilesPublicView(config)));
