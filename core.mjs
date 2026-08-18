@@ -341,10 +341,10 @@ export function normalizeRequest(input, config) {
         if (!Number.isSafeInteger(seed) || seed < 0) throw new PluginError('seed must be a non-negative safe integer', { status: 400, code: 'invalid_request' });
     }
     const requestedModel = input.model === undefined || input.model === '' ? (profile.model ?? defaults.model ?? '') : String(input.model);
-    if (input.model !== undefined && input.model !== '' && !Array.isArray(profile.allowedModels)) {
+    if (input.model !== undefined && input.model !== '' && (!Array.isArray(profile.allowedModels) || profile.allowedModels.length === 0)) {
         throw new PluginError('This profile does not allow selecting a model', { status: 400, code: 'invalid_request' });
     }
-    if (Array.isArray(profile.allowedModels) && !profile.allowedModels.includes(requestedModel)) {
+    if (Array.isArray(profile.allowedModels) && profile.allowedModels.length > 0 && !profile.allowedModels.includes(requestedModel)) {
         throw new PluginError('Requested model is not allowed by this profile', { status: 400, code: 'invalid_request' });
     }
     const allowedRatios = new Set(['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']);

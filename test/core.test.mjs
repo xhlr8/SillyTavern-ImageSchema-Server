@@ -37,6 +37,12 @@ test('request normalization has seed but rejects a separate id concept', () => {
     assert.throws(() => normalizeRequest({ prompt: 'cat', id: 'abc' }, config), /id parameter is not supported/);
 });
 
+test('empty allowedModels disables model overrides without rejecting the configured model', () => {
+    const config = { defaultProfile: 'p', profiles: { p: { type: 'openai', url: 'https://example.test', model: 'gpt-image-2', allowedModels: [], defaults: {} } } };
+    assert.equal(normalizeRequest({ prompt: 'cat' }, config).request.model, 'gpt-image-2');
+    assert.throws(() => normalizeRequest({ prompt: 'cat', model: 'other' }, config), /does not allow/);
+});
+
 test('OpenAI adapter sends configured URL and decodes b64_json', async () => {
     let captured;
     const fetchImpl = async (url, options) => {
