@@ -259,7 +259,16 @@ async function geminiInteractionsAdapter(profile, request, options = {}) {
     }
     let prompt = `Create exactly one image. ${request.prompt}`;
     if (request.negative) prompt += `\nAvoid: ${request.negative}`;
-    const body = { model: request.model, input: [{ type: 'text', text: prompt }] };
+    const imageFormat = {
+        type: 'image',
+        ...(request.aspectRatio ? { aspect_ratio: request.aspectRatio } : {}),
+        ...(request.imageSize ? { image_size: request.imageSize } : {}),
+    };
+    const body = {
+        model: request.model,
+        input: [{ type: 'text', text: prompt }],
+        response_format: imageFormat,
+    };
     const response = await checkedFetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal }, profile, fetchImpl, { diagnostics, scope, profile: profileName });
     const json = await responseJson(response, maxBytes, 'Gemini Interactions');
     const image = interactionImage(json);
@@ -317,8 +326,8 @@ export async function geminiSseAdapter(profile, request, options = {}) {
         ...(profile.imageConfig ?? {}),
         ...(request.aspectRatio ? { aspectRatio: request.aspectRatio } : {}),
         ...(request.imageSize ? { imageSize: request.imageSize } : {}),
-        ...(request.personGeneration ? { personGeneration: request.personGeneration } : {}),
     };
+    delete imageConfig.personGeneration;
     const body = {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
@@ -349,8 +358,12 @@ export async function geminiSseAdapter(profile, request, options = {}) {
                     return { data, mime: sniffMime(data, inline.mimeType ?? inline.mime_type) };
                 }
             }
-            if (/SAFETY|BLOCK/i.test(candidate?.finishReason ?? '')) {
-                throw new PluginError('Gemini blocked the image request for safety reasons', { status: 400, code: 'safety' });
+            const finishReason = String(candidate?.finishReason ?? '');
+            if (/SAFETY|BLOCK|PROHIBITED|RECITATION/i.test(finishReason)) {
+                throw new PluginError('Gemini rejected the prompt', { status: 400, code: 'safety' });
+            }
+            if (/NO_IMAGE|IMAGE_OTHER/i.test(finishReason)) {
+                throw new PluginError('Gemini returned no image', { status: 502, code: 'invalid_upstream_response' });
             }
         }
     }
@@ -418,11 +431,11 @@ export function normalizeRequest(input, config) {
     if (Array.isArray(profile.allowedModels) && profile.allowedModels.length > 0 && !profile.allowedModels.includes(requestedModel)) {
         throw new PluginError('Requested model is not allowed by this profile', { status: 400, code: 'invalid_request' });
     }
-    const allowedRatios = new Set(['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']);
+    const allowedRatios = new Set(['1:1', '1:4', '4:1', '1:8', '8:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']);
     const aspectRatio = String(input.aspectRatio ?? input.aspect_ratio ?? defaults.aspectRatio ?? '').toLowerCase();
     if (aspectRatio && !allowedRatios.has(aspectRatio)) throw new PluginError('aspect_ratio is not supported', { status: 400, code: 'invalid_request' });
     const imageSize = String(input.imageSize ?? input.image_size ?? defaults.imageSize ?? '').toUpperCase();
-    if (imageSize && !['1K', '2K', '4K'].includes(imageSize)) throw new PluginError('image_size must be 1K, 2K, or 4K', { status: 400, code: 'invalid_request' });
+    if (imageSize && !['512', '1K', '2K', '4K'].includes(imageSize)) throw new PluginError('image_size must be 512, 1K, 2K, or 4K', { status: 400, code: 'invalid_request' });
     let temperature = input.temperature ?? defaults.temperature;
     temperature = temperature === undefined || temperature === '' ? null : Number(temperature);
     if (temperature !== null && (!Number.isFinite(temperature) || temperature < 0 || temperature > 2)) throw new PluginError('temperature must be from 0 to 2', { status: 400, code: 'invalid_request' });
@@ -432,7 +445,7 @@ export function normalizeRequest(input, config) {
     let height = integer(input.height, defaults.height ?? 1024, 'height');
     if (aspectRatio && input.width === undefined && input.height === undefined) {
         const [rw, rh] = aspectRatio.split(':').map(Number);
-        const target = imageSize === '4K' ? 4096 : imageSize === '2K' ? 2048 : 1024;
+        const target = imageSize === '4K' ? 4096 : imageSize === '2K' ? 2048 : imageSize === '512' ? 512 : 1024;
         if (rw >= rh) {
             width = Math.min(maxDimension, target);
             height = Math.max(1, Math.round(width * rh / rw));

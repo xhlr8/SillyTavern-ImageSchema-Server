@@ -74,6 +74,7 @@ test('Gemini 3 adapter reads image output from the Interactions API', async () =
     assert.equal(result.mime, 'image/png');
     assert.match(captured.url, /\/google-ai\/v1beta\/interactions$/);
     assert.equal(captured.body.model, 'gemini-3.1-flash-image');
+    assert.deepEqual(captured.body.response_format, { type: 'image' });
     assert.match(captured.body.input[0].text, /Create exactly one image/);
     assert.equal(captured.headers.authorization, 'Bearer secret');
 });
