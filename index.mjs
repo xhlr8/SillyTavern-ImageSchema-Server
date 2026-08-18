@@ -7,6 +7,7 @@ import YAML from 'yaml';
 import { DiskCache, ImageService, PluginError, expandEnv, sniffMime, validateConfig } from './core.mjs';
 import { ActivityDiagnostics, diagnosticsContract, diagnosticsScope, isDiagnosticsAdmin, recordDiagnostic } from './diagnostics.mjs';
 import { ManagedProfileStore, profilesPublicView, validateManagedProfile, validateProfileName } from './managed-config.mjs';
+import { analyzeComfyWorkflow, validateComfyWorkflow } from './comfyui.mjs';
 
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
 let state = null;
@@ -149,7 +150,14 @@ function requireExplicitAdmin(request, _response, next) {
 
 function contractProfile(input) {
     const source = exactObject(input, 'profile');
-    const allowed = new Set(['name', 'type', 'url', 'method', 'model', 'allowedModels', 'timeoutMs', 'defaults']);
+    const common = ['name', 'type', 'url', 'model', 'allowedModels', 'timeoutMs', 'defaults'];
+    const byType = {
+        openai: [...common, 'body'],
+        'gemini-sse': [...common, 'queryApiKey', 'systemInstruction', 'generationConfig', 'imageConfig'],
+        generic: [...common, 'method', 'query', 'body', 'responseImagePath', 'responseMimePath', 'responseEncoding'],
+        comfyui: ['name', 'type', 'url', 'workflow', 'bindings', 'outputNode', 'pollIntervalMs', 'timeoutMs'],
+    };
+    const allowed = new Set(byType[source.type] ?? common);
     for (const key of Object.keys(source)) if (!allowed.has(key)) throw new PluginError(`profile contains unsupported field: ${key}`, { status: 400, code: 'invalid_config' });
     const { name, ...profile } = source;
     return { name: validateProfileName(name), profile: validateManagedProfile(profile) };
@@ -160,6 +168,48 @@ function exactObject(value, label) {
     return value;
 }
 
+function comfyObjectInfoUrl(value) {
+    if (typeof value !== 'string' || value.length > 8192) throw new PluginError('url must be an HTTP(S) URL', { status: 400, code: 'invalid_request' });
+    let url;
+    try {
+        url = new URL(value);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('unsafe URL');
+    } catch {
+        throw new PluginError('url must be an HTTP(S) URL without embedded credentials', { status: 400, code: 'invalid_request' });
+    }
+    url.pathname = `${url.pathname.replace(/\/+$/, '')}/object_info`.replace(/\/{2,}/g, '/');
+    url.search = '';
+    url.hash = '';
+    return url;
+}
+
+async function limitedJson(response, maximum = 32 * 1024 * 1024) {
+    const declared = Number(response.headers.get('content-length'));
+    if (declared && declared > maximum) throw new PluginError('ComfyUI object_info response is too large', { status: 502, code: 'response_too_large' });
+    const reader = response.body?.getReader?.();
+    let data;
+    if (!reader) {
+        data = Buffer.from(await response.arrayBuffer());
+        if (data.length > maximum) throw new PluginError('ComfyUI object_info response is too large', { status: 502, code: 'response_too_large' });
+    } else {
+        const chunks = [];
+        let total = 0;
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > maximum) {
+                await reader.cancel().catch(() => {});
+                throw new PluginError('ComfyUI object_info response is too large', { status: 502, code: 'response_too_large' });
+            }
+            chunks.push(Buffer.from(value));
+        }
+        data = Buffer.concat(chunks, total);
+    }
+    try { return JSON.parse(data.toString('utf8')); }
+    catch (error) { throw new PluginError('ComfyUI object_info response was not JSON', { status: 502, code: 'invalid_upstream_response', cause: error }); }
+}
+
 function contractConfigView(view) {
     return {
         defaultProfile: view.defaultProfile,
@@ -167,7 +217,20 @@ function contractConfigView(view) {
             name: profile.name,
             type: profile.type,
             url: profile.url,
-            ...(profile.type === 'generic' ? { method: profile.method ?? 'GET' } : {}),
+            ...(profile.type === 'generic' ? {
+                method: profile.method ?? 'GET',
+                ...(profile.query ? { query: profile.query } : {}),
+                ...(profile.body ? { body: profile.body } : {}),
+                ...(profile.responseImagePath ? { responseImagePath: profile.responseImagePath } : {}),
+                ...(profile.responseMimePath ? { responseMimePath: profile.responseMimePath } : {}),
+                ...(profile.responseEncoding ? { responseEncoding: profile.responseEncoding } : {}),
+            } : {}),
+            ...(profile.type === 'comfyui' ? {
+                workflow: profile.workflow,
+                bindings: profile.bindings,
+                ...(profile.outputNode ? { outputNode: profile.outputNode } : {}),
+                pollIntervalMs: profile.pollIntervalMs ?? 500,
+            } : {}),
             model: profile.model ?? '',
             allowedModels: profile.allowedModels ?? [],
             timeoutMs: profile.timeoutMs ?? 120000,
@@ -284,6 +347,32 @@ export async function init(router) {
         }
         routeEvent(request, { event: 'provider.secret', action: body.clear === true ? 'clear' : 'replace', profile: name, status: 200 });
         return response.json({ ok: true, name, apiKeyConfigured: body.clear !== true });
+    }));
+    router.post('/providers/comfy/analyze', requireAdmin, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['url', 'workflow']));
+        const invalid = message => new PluginError(message, { status: 400, code: 'invalid_request' });
+        const workflow = validateComfyWorkflow(body.workflow, 'workflow', invalid);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 30_000);
+        let upstream;
+        try {
+            upstream = await fetch(comfyObjectInfoUrl(body.url), {
+                method: 'GET',
+                headers: { accept: 'application/json' },
+                redirect: 'follow',
+                signal: controller.signal,
+            });
+        } catch (error) {
+            const timeout = error?.name === 'AbortError' || error?.name === 'TimeoutError';
+            throw new PluginError(timeout ? 'ComfyUI object_info request timed out' : 'Could not fetch ComfyUI object_info', { status: timeout ? 504 : 502, code: timeout ? 'timeout' : 'connection_error', cause: error });
+        } finally {
+            clearTimeout(timer);
+        }
+        if (!upstream.ok) throw new PluginError(`ComfyUI object_info returned HTTP ${upstream.status}`, { status: 502, code: 'upstream_error' });
+        const objectInfo = await limitedJson(upstream);
+        const analysis = analyzeComfyWorkflow(workflow, objectInfo);
+        routeEvent(request, { event: 'provider.comfy.analyze', action: 'analyze', status: 200 });
+        return response.json({ ok: true, analysis });
     }));
     router.post('/providers/profile/test', requireAdmin, asyncRoute(async (request, response) => {
         const body = exactBody(request, new Set(['profile', 'prompt']));

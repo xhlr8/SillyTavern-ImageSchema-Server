@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/p
 import path from 'node:path';
 
 import { recordDiagnostic } from './diagnostics.mjs';
+import { applyComfyBindings, validateComfyBindings, validateComfyWorkflow } from './comfyui.mjs';
 
 export class PluginError extends Error {
     constructor(message, { status = 502, code = 'upstream_error', cause } = {}) {
@@ -141,7 +142,7 @@ async function checkedFetch(url, options, profile, fetchImpl, activity = {}) {
         throw new PluginError('Upstream image request failed', { status: 502, code: 'connection_error', cause: error });
     }
     if (!response.ok) {
-        const text = await response.text().catch(() => '');
+        const text = await responseBuffer(response, 64 * 1024).then(data => data.toString('utf8')).catch(() => '');
         const status = response.status === 429 ? 429 : response.status >= 400 && response.status < 500 ? 400 : 502;
         const code = response.status === 429 ? 'rate_limit' : response.status === 400 || /safety|policy|moderation|blocked|filter|bad object/i.test(text) ? 'safety' : 'upstream_error';
         diagnostic({ level: 'error', status: response.status, code });
@@ -370,6 +371,103 @@ export async function geminiSseAdapter(profile, request, options = {}) {
     throw new PluginError('Gemini returned no image; verify that the selected upstream model supports image output', { code: 'invalid_upstream_response' });
 }
 
+function comfyUrl(base, endpoint) {
+    const url = new URL(base);
+    url.pathname = `${url.pathname.replace(/\/+$/, '')}/${endpoint.replace(/^\/+/, '')}`.replace(/\/{2,}/g, '/');
+    url.search = '';
+    url.hash = '';
+    return url;
+}
+
+function comfyImage(history, promptId, outputNode) {
+    const record = history?.[promptId] ?? (history?.outputs ? history : null);
+    const outputs = record?.outputs;
+    if (!outputs || typeof outputs !== 'object' || Array.isArray(outputs)) return null;
+    const nodeIds = outputNode ? [String(outputNode)] : Object.keys(outputs);
+    for (const nodeId of nodeIds) {
+        const images = outputs?.[nodeId]?.images;
+        if (!Array.isArray(images)) continue;
+        for (const image of images) {
+            if (image && typeof image === 'object' && typeof image.filename === 'string' && image.filename) return image;
+        }
+    }
+    return null;
+}
+
+function abortableDelay(milliseconds, signal) {
+    if (!signal) return new Promise(resolve => setTimeout(resolve, milliseconds));
+    if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(done, milliseconds);
+        function done() {
+            signal.removeEventListener('abort', aborted);
+            resolve();
+        }
+        function aborted() {
+            clearTimeout(timer);
+            signal.removeEventListener('abort', aborted);
+            reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+        }
+        signal.addEventListener('abort', aborted, { once: true });
+    });
+}
+
+export async function comfyUiAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
+    const timeoutMs = Number(profile.timeoutMs ?? 180000);
+    const operationSignal = combineSignal(timeoutMs, signal);
+    const activity = { diagnostics, scope, profile: profileName };
+    const headers = { 'content-type': 'application/json', accept: 'application/json', ...(profile.headers ?? {}) };
+    const workflow = applyComfyBindings(profile, request);
+    const promptResponse = await checkedFetch(comfyUrl(profile.url, 'prompt'), {
+        method: 'POST', headers, body: JSON.stringify({ prompt: workflow }), signal: operationSignal,
+    }, profile, fetchImpl, activity);
+    const promptJson = await responseJson(promptResponse, Math.min(maxBytes, 8 * 1024 * 1024), 'ComfyUI prompt');
+    const promptId = promptJson?.prompt_id;
+    if (typeof promptId !== 'string' && typeof promptId !== 'number') {
+        throw new PluginError('ComfyUI response contained no prompt_id', { code: 'invalid_upstream_response' });
+    }
+    const promptKey = String(promptId);
+    const pollIntervalMs = Number(profile.pollIntervalMs ?? 500);
+    let selected;
+    while (!selected) {
+        let historyResponse;
+        try {
+            historyResponse = await checkedFetch(comfyUrl(profile.url, `history/${encodeURIComponent(promptKey)}`), {
+                method: 'GET', headers: { accept: 'application/json', ...(profile.headers ?? {}) }, signal: operationSignal,
+            }, profile, fetchImpl, activity);
+        } catch (error) {
+            if (error instanceof PluginError && error.status === 400) throw new PluginError('ComfyUI rejected the history request', { status: 502, code: 'upstream_error', cause: error });
+            throw error;
+        }
+        const history = await responseJson(historyResponse, Math.min(maxBytes, 16 * 1024 * 1024), 'ComfyUI history');
+        selected = comfyImage(history, promptKey, profile.outputNode);
+        const record = history?.[promptKey] ?? (history?.outputs ? history : null);
+        if (!selected && record) {
+            const messages = record?.status?.messages ?? record?.status_messages ?? [];
+            if (record?.status?.status_str === 'error' || /execution_error|error/i.test(JSON.stringify(messages))) {
+                throw new PluginError('ComfyUI workflow execution failed', { code: 'upstream_error' });
+            }
+            if (record?.outputs && typeof record.outputs === 'object') {
+                const label = profile.outputNode ? ` at output node ${profile.outputNode}` : '';
+                throw new PluginError(`ComfyUI workflow completed without an image${label}`, { code: 'invalid_upstream_response' });
+            }
+        }
+        if (!selected) {
+            try { await abortableDelay(pollIntervalMs, operationSignal); }
+            catch (error) { throw new PluginError('Upstream image request timed out', { status: 504, code: 'timeout', cause: error }); }
+        }
+    }
+    const viewUrl = comfyUrl(profile.url, 'view');
+    viewUrl.searchParams.set('filename', selected.filename);
+    if (typeof selected.subfolder === 'string' && selected.subfolder) viewUrl.searchParams.set('subfolder', selected.subfolder);
+    if (typeof selected.type === 'string' && selected.type) viewUrl.searchParams.set('type', selected.type);
+    const imageResponse = await checkedFetch(viewUrl, {
+        method: 'GET', headers: { accept: 'image/*', ...(profile.headers ?? {}) }, signal: operationSignal,
+    }, profile, fetchImpl, activity);
+    const data = await responseBuffer(imageResponse, maxBytes);
+    return { data, mime: sniffMime(data, imageResponse.headers.get('content-type')) };
+}
+
 export async function genericAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
     const method = String(profile.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST'].includes(method)) throw new PluginError(`Generic profile method must be GET or POST`, { status: 500, code: 'config_error' });
@@ -491,12 +589,19 @@ export function validateConfig(config) {
     if (!config.profiles[config.defaultProfile]) throw new PluginError(`Default profile does not exist: ${config.defaultProfile}`, { status: 500, code: 'config_error' });
     for (const [name, profile] of Object.entries(config.profiles)) {
         if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new PluginError(`Invalid profile name: ${name}`, { status: 500, code: 'config_error' });
-        if (!['openai', 'gemini-sse', 'generic'].includes(profile.type)) throw new PluginError(`Invalid type for profile ${name}`, { status: 500, code: 'config_error' });
+        if (!['openai', 'gemini-sse', 'generic', 'comfyui'].includes(profile.type)) throw new PluginError(`Invalid type for profile ${name}`, { status: 500, code: 'config_error' });
         try {
             const url = new URL(profile.url);
             if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported protocol');
         } catch {
             throw new PluginError(`Invalid URL for profile ${name}`, { status: 500, code: 'config_error' });
+        }
+        if (profile.type === 'comfyui') {
+            const invalid = message => new PluginError(message, { status: 500, code: 'config_error' });
+            profile.workflow = validateComfyWorkflow(profile.workflow, `Profile ${name} workflow`, invalid);
+            profile.bindings = validateComfyBindings(profile.bindings, profile.workflow, `Profile ${name} bindings`, invalid);
+            if (profile.outputNode !== undefined && !Object.hasOwn(profile.workflow, String(profile.outputNode))) throw invalid(`Profile ${name} outputNode does not exist in workflow`);
+            if (profile.pollIntervalMs !== undefined && (!Number.isSafeInteger(profile.pollIntervalMs) || profile.pollIntervalMs < 50 || profile.pollIntervalMs > 60_000)) throw invalid(`Profile ${name} pollIntervalMs must be an integer from 50 to 60000`);
         }
     }
     return config;
@@ -671,6 +776,7 @@ export class ImageService {
             case 'openai': result = await openAiAdapter(prepared.profile, prepared.request, options); break;
             case 'gemini-sse': result = await geminiSseAdapter(prepared.profile, prepared.request, options); break;
             case 'generic': result = await genericAdapter(prepared.profile, prepared.request, options); break;
+            case 'comfyui': result = await comfyUiAdapter(prepared.profile, prepared.request, options); break;
             default: throw new PluginError('Unsupported profile type', { status: 500, code: 'config_error' });
         }
         const entry = this.cache ? await this.cache.set(prepared.key, result) : { ...result, etag: createHash('sha256').update(result.data).digest('hex'), cached: false };

@@ -3,6 +3,7 @@ import { chmod, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
 import { PluginError, profilePublicView, validateConfig } from './core.mjs';
+import { validateComfyBindings, validateComfyWorkflow } from './comfyui.mjs';
 
 const PROFILE_NAME = /^[A-Za-z0-9_-]+$/;
 const HTTP_HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
@@ -14,6 +15,7 @@ const TYPE_FIELDS = {
     openai: new Set([...COMMON_FIELDS, 'body']),
     'gemini-sse': new Set([...COMMON_FIELDS, 'queryApiKey', 'systemInstruction', 'generationConfig', 'imageConfig']),
     generic: new Set([...COMMON_FIELDS, 'method', 'query', 'body', 'responseImagePath', 'responseMimePath', 'responseEncoding']),
+    comfyui: new Set(['type', 'url', 'workflow', 'bindings', 'outputNode', 'pollIntervalMs', 'timeoutMs', 'defaults']),
 };
 const DEFAULT_FIELDS = new Set(['width', 'height', 'negative', 'model', 'quality', 'outputFormat', 'background', 'enhance', 'aspectRatio', 'imageSize', 'temperature', 'personGeneration']);
 
@@ -89,7 +91,7 @@ export function validateManagedProfile(input, name = 'profile') {
     plainObject(input, name);
     const type = input.type;
     const allowed = TYPE_FIELDS[type];
-    if (!allowed) throw invalid(`${name}.type must be openai, gemini-sse, or generic`);
+    if (!allowed) throw invalid(`${name}.type must be openai, gemini-sse, generic, or comfyui`);
     exactFields(input, allowed, name);
     const result = { type, url: validateUrl(input.url, `${name}.url`) };
     if (input.headers !== undefined) result.headers = safeJson(input.headers, `${name}.headers`);
@@ -116,6 +118,20 @@ export function validateManagedProfile(input, name = 'profile') {
         if (input.systemInstruction !== undefined) result.systemInstruction = optionalString(input.systemInstruction, `${name}.systemInstruction`);
         if (input.generationConfig !== undefined) result.generationConfig = safeJson(input.generationConfig, `${name}.generationConfig`);
         if (input.imageConfig !== undefined) result.imageConfig = safeJson(input.imageConfig, `${name}.imageConfig`);
+    }
+    if (type === 'comfyui') {
+        const workflow = validateComfyWorkflow(input.workflow, `${name}.workflow`, invalid);
+        result.workflow = workflow;
+        result.bindings = validateComfyBindings(input.bindings, workflow, `${name}.bindings`, invalid);
+        if (input.outputNode !== undefined) {
+            const outputNode = String(input.outputNode);
+            if (!outputNode || outputNode.length > 200 || !Object.hasOwn(workflow, outputNode)) throw invalid(`${name}.outputNode must identify a workflow node`);
+            result.outputNode = outputNode;
+        }
+        if (input.pollIntervalMs !== undefined) {
+            if (!Number.isSafeInteger(input.pollIntervalMs) || input.pollIntervalMs < 50 || input.pollIntervalMs > 60_000) throw invalid(`${name}.pollIntervalMs must be an integer from 50 to 60000`);
+            result.pollIntervalMs = input.pollIntervalMs;
+        }
     }
     if (type === 'generic') {
         const method = String(input.method ?? 'GET').toUpperCase();
@@ -224,6 +240,13 @@ function stripSecrets(value, depth = 0, { hideAllHeaders = false } = {}) {
     if (Array.isArray(value)) return value.map(item => stripSecrets(item, depth + 1, { hideAllHeaders }));
     const result = {};
     for (const [key, item] of Object.entries(value)) {
+        // ComfyUI workflows are validated server-side plain JSON and intentionally
+        // returned for UI editing. Node/input names that happen to contain words
+        // such as "token" are workflow semantics, not provider credentials.
+        if (key === 'workflow' && item && typeof item === 'object' && !Array.isArray(item)) {
+            result.workflow = structuredClone(item);
+            continue;
+        }
         if (SENSITIVE_KEY.test(key)) continue;
         if (key === 'headers' && item && typeof item === 'object' && !Array.isArray(item)) {
             if (hideAllHeaders) {
