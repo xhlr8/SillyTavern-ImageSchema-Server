@@ -364,7 +364,10 @@ export async function init(router) {
             });
         } catch (error) {
             const timeout = error?.name === 'AbortError' || error?.name === 'TimeoutError';
-            throw new PluginError(timeout ? 'ComfyUI object_info request timed out' : 'Could not fetch ComfyUI object_info', { status: timeout ? 504 : 502, code: timeout ? 'timeout' : 'connection_error', cause: error });
+            const protocolHint = String(body.url ?? '').startsWith('https:')
+                ? ' Check whether ComfyUI is using plain HTTP; its default listener is http://.'
+                : '';
+            throw new PluginError(timeout ? 'ComfyUI object_info request timed out' : `Could not fetch ComfyUI object_info.${protocolHint}`, { status: timeout ? 504 : 502, code: timeout ? 'timeout' : 'connection_error', cause: error });
         } finally {
             clearTimeout(timer);
         }

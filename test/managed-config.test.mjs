@@ -84,6 +84,12 @@ test('managed merge precedence overrides, tombstones, and default selection pred
     assert.deepEqual(Object.keys(merged.profiles), ['other', 'added']);
 });
 
+test('save treats a stale previousName as an upsert', async t => {
+    const { store } = await fixture(t);
+    await store.save('new-profile', { type: 'generic', url: 'https://new.example.test', method: 'GET' }, 'missing-old-name');
+    assert.equal(store.config.profiles['new-profile'].url, 'https://new.example.test');
+});
+
 test('save supports atomic extension-contract rename and retains matching managed secret', async t => {
     const { store } = await fixture(t);
     await store.create('old', { type: 'openai', url: 'https://old.example.test', model: 'old' });

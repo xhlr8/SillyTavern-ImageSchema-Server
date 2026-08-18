@@ -382,6 +382,9 @@ export class ManagedProfileStore {
         validateProfileName(name);
         validateProfileName(previousName);
         if (previousName === name) return this.config.profiles[name] ? this.update(name, profile) : this.create(name, profile);
+        // A client may retain a previousName after an earlier failed create or a
+        // plugin restart. Treat that stale rename hint as an upsert of `name`.
+        if (!this.config.profiles[previousName]) return this.config.profiles[name] ? this.update(name, profile) : this.create(name, profile);
         return this.mutate(next => {
             if (!this.config.profiles[previousName]) throw new PluginError(`Unknown profile: ${previousName}`, { status: 404, code: 'invalid_profile' });
             if (this.config.profiles[name]) throw new PluginError(`Profile already exists: ${name}`, { status: 409, code: 'profile_exists' });
