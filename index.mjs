@@ -4,7 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 
-import { DiskCache, ImageService, PluginError, expandEnv, profilePublicView, sniffMime, validateConfig } from './core.mjs';
+import { DiskCache, ImageService, PluginError, expandEnv, sniffMime, validateConfig } from './core.mjs';
+import { ManagedProfileStore, profilesPublicView, validateManagedProfile, validateProfileName } from './managed-config.mjs';
 
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
 let state = null;
@@ -111,20 +112,73 @@ async function errorImage(config, error) {
     }
 }
 
-function publicProfiles(config) {
+function exactBody(request, allowed) {
+    const body = request.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new PluginError('Request body must be an object', { status: 400, code: 'invalid_request' });
+    for (const key of Object.keys(body)) {
+        if (!allowed.has(key)) throw new PluginError(`Unsupported request field: ${key}`, { status: 400, code: 'invalid_request' });
+    }
+    return body;
+}
+
+function requireAdmin(request, _response, next) {
+    const profile = request.user?.profile;
+    if (profile && Object.hasOwn(profile, 'admin') && profile.admin !== true) {
+        return next(new PluginError('Administrator access is required', { status: 403, code: 'forbidden' }));
+    }
+    return next();
+}
+
+function contractProfile(input) {
+    const source = exactObject(input, 'profile');
+    const allowed = new Set(['name', 'type', 'url', 'method', 'model', 'allowedModels', 'timeoutMs', 'defaults']);
+    for (const key of Object.keys(source)) if (!allowed.has(key)) throw new PluginError(`profile contains unsupported field: ${key}`, { status: 400, code: 'invalid_config' });
+    const { name, ...profile } = source;
+    return { name: validateProfileName(name), profile: validateManagedProfile(profile) };
+}
+
+function exactObject(value, label) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new PluginError(`${label} must be an object`, { status: 400, code: 'invalid_request' });
+    return value;
+}
+
+function contractConfigView(view) {
     return {
-        defaultProfile: config.defaultProfile,
-        profiles: Object.entries(config.profiles).map(([name, profile]) => profilePublicView(name, profile, name === config.defaultProfile)),
+        defaultProfile: view.defaultProfile,
+        profiles: Object.values(view.profiles).map(profile => ({
+            name: profile.name,
+            type: profile.type,
+            url: profile.url,
+            ...(profile.type === 'generic' ? { method: profile.method ?? 'GET' } : {}),
+            model: profile.model ?? '',
+            allowedModels: profile.allowedModels ?? [],
+            timeoutMs: profile.timeoutMs ?? 120000,
+            defaults: profile.defaults ?? {},
+            apiKeyConfigured: profile.hasSecret === true,
+        })),
     };
 }
 
 export async function init(router) {
     if (state) throw new PluginError('Image server plugin is already initialized', { status: 500, code: 'config_error' });
-    const { config, configPath } = await loadConfig();
-    const cacheDirectorySetting = config.cache?.directory ?? './cache';
+    const { config: baseConfig, configPath } = await loadConfig();
+    const managedSetting = process.env.SILLYTAVERN_IMAGE_MANAGED_CONFIG || path.join(pluginDirectory, 'managed-config.json');
+    const managedPath = path.isAbsolute(managedSetting) ? managedSetting : path.resolve(pluginDirectory, managedSetting);
+    const cacheDirectorySetting = baseConfig.cache?.directory ?? './cache';
     const configuredCacheDirectory = path.isAbsolute(cacheDirectorySetting) ? cacheDirectorySetting : path.resolve(pluginDirectory, cacheDirectorySetting);
     const caches = new Map();
     const services = new Map();
+    let config;
+    const store = new ManagedProfileStore({
+        baseConfig,
+        filePath: managedPath,
+        onChange: nextConfig => {
+            config = nextConfig;
+            for (const service of services.values()) service.setConfig(nextConfig);
+            if (state) state.config = nextConfig;
+        },
+    });
+    config = await store.load();
     const getUserState = async request => {
         const handle = String(request.user?.profile?.handle ?? 'default').replace(/[^A-Za-z0-9_-]/g, '_');
         if (!caches.has(handle)) {
@@ -136,7 +190,7 @@ export async function init(router) {
         }
         return { cache: caches.get(handle), service: services.get(handle) };
     };
-    state = { config, configPath, caches, services };
+    state = { config, baseConfig, configPath, managedPath, store, caches, services };
 
     router.get('/image/:prompt(*)', asyncRoute(async (request, response) => {
         try {
@@ -161,9 +215,67 @@ export async function init(router) {
         return sendImage(request, response, result, config);
     }));
 
-    router.get('/status', (_request, response) => response.json({ ok: true, version: '1.0.0', ...publicProfiles(config) }));
-    router.get('/profiles', (_request, response) => response.json(publicProfiles(config)));
-    router.post('/profiles', (_request, response) => response.json(publicProfiles(config)));
+    router.get('/status', (_request, response) => response.json({ ok: true, version: '1.1.0', ...profilesPublicView(config) }));
+    router.get('/profiles', (_request, response) => response.json(profilesPublicView(config)));
+    // Compatibility route used by existing clients; it remains read-only despite POST.
+    router.post('/profiles', (_request, response) => response.json(profilesPublicView(config)));
+
+    router.get('/providers/config', (_request, response) => response.json(contractConfigView(store.view())));
+    router.post('/providers/profile/save', requireAdmin, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['profile', 'previousName']));
+        const { name, profile } = contractProfile(body.profile);
+        const previousName = body.previousName === undefined ? name : validateProfileName(body.previousName);
+        await store.save(name, profile, previousName);
+        return response.json({ ok: true, name });
+    }));
+    router.post('/providers/profile/delete', requireAdmin, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['name']));
+        const name = validateProfileName(body.name);
+        await store.delete(name);
+        return response.json({ ok: true, name });
+    }));
+    router.post('/providers/default', requireAdmin, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['name']));
+        const name = validateProfileName(body.name);
+        await store.setDefault(name);
+        return response.json({ ok: true, defaultProfile: name });
+    }));
+    router.post('/providers/secret', requireAdmin, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['name', 'apiKey', 'clear']));
+        const name = validateProfileName(body.name);
+        if (body.clear === true) {
+            if (body.apiKey !== undefined) throw new PluginError('apiKey and clear cannot be combined', { status: 400, code: 'invalid_request' });
+            await store.deleteSecret(name);
+        } else {
+            if (body.clear !== undefined) throw new PluginError('clear must be true when provided', { status: 400, code: 'invalid_request' });
+            const profile = config.profiles[name];
+            if (!profile) throw new PluginError(`Unknown profile: ${name}`, { status: 404, code: 'invalid_profile' });
+            const secret = profile.type === 'generic'
+                ? { headerName: 'Authorization', value: `Bearer ${body.apiKey ?? ''}` }
+                : { apiKey: body.apiKey };
+            await store.replaceSecret(name, secret);
+        }
+        return response.json({ ok: true, name, apiKeyConfigured: body.clear !== true });
+    }));
+    router.post('/providers/profile/test', requireAdmin, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['profile', 'prompt']));
+        const { name, profile } = contractProfile(body.profile);
+        const existing = config.profiles[name];
+        const inheritedSecret = existing?.type === profile.type
+            ? {
+                ...(existing.apiKey ? { apiKey: existing.apiKey } : {}),
+                ...(existing.headers ? { headers: structuredClone(existing.headers) } : {}),
+            }
+            : {};
+        const testProfile = { ...profile, ...inheritedSecret };
+        const testConfig = validateConfig({ ...structuredClone(config), defaultProfile: name, profiles: { ...structuredClone(config.profiles), [name]: testProfile } });
+        const testService = new ImageService(testConfig, { cache: null });
+        const prompt = body.prompt === undefined ? 'A small red circle on a plain white background' : body.prompt;
+        if (typeof prompt !== 'string' || !prompt.trim()) throw new PluginError('prompt must be a non-empty string', { status: 400, code: 'invalid_request' });
+        const result = await testService.generate({ profile: name, prompt }, { bypassCache: true });
+        return response.json({ ok: true, profile: name, mime: result.mime, bytes: result.data.length });
+    }));
+
     router.post('/cache/stats', asyncRoute(async (request, response) => {
         const { cache, service } = await getUserState(request);
         return response.json({ ...(await cache.stats()), inflight: service.inflight.size });
@@ -204,7 +316,7 @@ export async function init(router) {
         return response.status(normalized.status).json({ error: { code: normalized.code, message: normalized.message } });
     });
 
-    console.log(`[${info.id}] loaded ${Object.keys(config.profiles).length} profile(s) from ${configPath}`);
+    console.log(`[${info.id}] loaded ${Object.keys(config.profiles).length} profile(s) from base and managed configuration`);
 }
 
 export async function exit() {

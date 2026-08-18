@@ -123,13 +123,13 @@ async function checkedFetch(url, options, profile, fetchImpl) {
         if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
             throw new PluginError('Upstream image request timed out', { status: 504, code: 'timeout', cause: error });
         }
-        throw new PluginError(`Upstream image request failed: ${error?.message ?? error}`, { status: 502, code: 'connection_error', cause: error });
+        throw new PluginError('Upstream image request failed', { status: 502, code: 'connection_error', cause: error });
     }
     if (!response.ok) {
         const text = await response.text().catch(() => '');
         const status = response.status === 429 ? 429 : response.status >= 400 && response.status < 500 ? 400 : 502;
         const code = response.status === 429 ? 'rate_limit' : /safety|policy|moderation|blocked|filter/i.test(text) ? 'safety' : 'upstream_error';
-        throw new PluginError(`Upstream HTTP ${response.status}${text ? `: ${text.slice(0, 500)}` : ''}`, { status, code });
+        throw new PluginError(`Upstream HTTP ${response.status}`, { status, code });
     }
     return response;
 }
@@ -493,6 +493,10 @@ export class ImageService {
         this.cache = cache;
         this.fetchImpl = fetchImpl;
         this.inflight = new Map();
+    }
+
+    setConfig(config) {
+        this.config = validateConfig(config);
     }
 
     prepare(input) {

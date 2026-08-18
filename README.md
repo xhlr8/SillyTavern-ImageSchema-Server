@@ -73,6 +73,16 @@ The example uses `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `IMAGE_API_KEY`; these 
 
 Do not confuse this configuration with the repository-root legacy `config.yaml`; their schemas are incompatible.
 
+## UI-managed provider profiles
+
+The companion extension can create, edit, rename, delete, test, and select provider profiles from its **Provider Profiles** drawer. UI-managed changes are stored in `managed-config.json` beside the plugin by default, or at `SILLYTAVERN_IMAGE_MANAGED_CONFIG` when set. The file is atomically replaced and restricted to mode `0600` where supported.
+
+The base `config.yaml` remains supported and is never overwritten. Managed profiles override same-named base profiles, can tombstone base profiles, and can select a managed default. Changes update active per-user image services without restarting SillyTavern.
+
+Secrets use a dedicated write-only route. Sanitized configuration responses expose only whether a secret is configured; API-key values are never returned to the browser. Provider mutations require an administrator when SillyTavern supplies an `admin` property on the authenticated user profile.
+
+Supported UI provider types are currently OpenAI-compatible, Gemini SSE, and generic GET/POST. The ComfyUI settings area is reserved for a future workflow adapter and is not functional yet.
+
 ## Top-level configuration
 
 ```yaml
@@ -315,6 +325,12 @@ Accepts a request, deletes its current canonical entry, regenerates while bypass
 ### `POST /test`
 
 Generates with the submitted values, or a small default prompt when none is supplied. Returns JSON metadata (`ok`, profile, MIME, bytes, cached flag, seed), not the image. Cache reads are bypassed.
+
+### Provider-management routes
+
+The extension uses `GET /providers/config` plus POST routes `/providers/profile/save`, `/providers/profile/delete`, `/providers/default`, `/providers/secret`, and `/providers/profile/test`. They accept strict allowlisted bodies. Config responses contain sanitized profile data and `apiKeyConfigured` only; secret values are never returned.
+
+Lower-level `/config` routes are also available for administrative integrations, as documented by the source contract.
 
 These routes are intentionally absent from the model instruction. The extension uses same-origin requests, but the plugin does not implement an additional user/role/quota layer of its own.
 
