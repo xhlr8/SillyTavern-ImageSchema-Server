@@ -1,0 +1,92 @@
+# Copy this file to config.yaml. All upstream URLs and credentials are fixed here;
+# browser requests can select a named profile, but cannot supply an arbitrary URL.
+defaultProfile: gemini
+
+limits:
+  maxPromptLength: 12000
+  maxDimension: 4096
+  maxResponseBytes: 52428800
+  maxConcurrentRequests: 4
+
+cache:
+  enabled: true
+  # Separate cache directories per authenticated SillyTavern user by default.
+  perUser: true
+  # Relative paths are resolved from this plugin directory.
+  directory: ./cache
+  # Successful entries are persistent by default, including the first random
+  # result for a seedless canonical request. Set ttlSeconds to a non-negative
+  # number only when expiration is explicitly desired.
+  ttlSeconds: null
+
+# Optional images returned by GET /image on errors. These may point outside the
+# plugin, such as the existing image-server/static/error_images directory.
+errorImages:
+  rateLimit: ../static/error_images/error_429.png
+  safety: ../static/error_images/error_safety.png
+  timeout: ../static/error_images/error_timeout.png
+  upstream: ../static/error_images/error_500.png
+  unknown: ../static/error_images/error_unknown.png
+
+profiles:
+  openai:
+    type: openai
+    url: https://api.openai.com/v1/images/generations
+    apiKey: ${OPENAI_API_KEY}
+    model: gpt-image-1
+    timeoutMs: 180000
+    defaults:
+      width: 1024
+      height: 1024
+      quality: medium
+      outputFormat: png
+      background: opaque
+    # Extra fixed body values are allowed. Request fields take precedence only
+    # for the documented generation options, never URL/authentication.
+    body:
+      moderation: auto
+
+  gemini:
+    type: gemini-sse
+    url: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:streamGenerateContent
+    apiKey: ${GEMINI_API_KEY}
+    # queryApiKey sends the key as ?key=...; set false to use x-goog-api-key.
+    queryApiKey: true
+    timeoutMs: 180000
+    systemInstruction: Generate exactly one image. Output the image only.
+    defaults:
+      width: 1024
+      height: 1024
+
+  generic-get:
+    type: generic
+    method: GET
+    url: https://image.example.invalid/generate/{prompt}
+    timeoutMs: 180000
+    headers:
+      Authorization: Bearer ${IMAGE_API_KEY}
+    query:
+      width: "{width}"
+      height: "{height}"
+      seed: "{seed}"
+      negative: "{negative}"
+    # Omit responseImagePath when the response itself is image bytes.
+    # responseImagePath: data.0.b64_json
+    responseEncoding: base64
+
+  generic-post:
+    type: generic
+    method: POST
+    url: https://image.example.invalid/v1/generate
+    timeoutMs: 180000
+    headers:
+      Authorization: Bearer ${IMAGE_API_KEY}
+    body:
+      prompt: "{prompt}"
+      negative_prompt: "{negative}"
+      width: "{width}"
+      height: "{height}"
+      seed: "{seed}"
+    responseImagePath: images.0.base64
+    responseMimePath: images.0.mime_type
+    responseEncoding: base64

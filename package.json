@@ -1,0 +1,19 @@
+{
+  "name": "sillytavern-image-server-plugin",
+  "version": "1.0.0",
+  "description": "Configured, cached image generation routes for SillyTavern",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": "./index.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-isolation=none"
+  },
+  "dependencies": {
+    "yaml": "^2.8.3"
+  },
+  "license": "MIT",
+  "private": true
+}
