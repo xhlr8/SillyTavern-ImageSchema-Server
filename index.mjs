@@ -96,20 +96,30 @@ function sendImage(request, response, result, config) {
     return response.status(200).send(result.data);
 }
 
+function builtInErrorImage(error) {
+    const rejected = error.status === 400 || error.code === 'safety' || error.code === 'invalid_request';
+    const title = rejected ? 'Rejected Prompt' : 'Image Generation Failed';
+    const subtitle = rejected ? 'The provider declined this request.' : 'Check Plugin activity for details.';
+    const accent = rejected ? '#ff8fa3' : '#ffb86b';
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="768" height="384" viewBox="0 0 768 384"><rect width="768" height="384" rx="24" fill="#151722"/><rect x="12" y="12" width="744" height="360" rx="18" fill="none" stroke="${accent}" stroke-width="4"/><text x="384" y="176" text-anchor="middle" fill="${accent}" font-family="system-ui,sans-serif" font-size="42" font-weight="700">${title}</text><text x="384" y="226" text-anchor="middle" fill="#d8d9e8" font-family="system-ui,sans-serif" font-size="20">${subtitle}</text></svg>`;
+    const data = Buffer.from(svg, 'utf8');
+    return { data, mime: 'image/svg+xml', etag: createHash('sha256').update(data).digest('hex'), cached: false, error: true };
+}
+
 async function errorImage(config, error) {
     const category = error.code === 'rate_limit' ? 'rateLimit'
-        : error.code === 'safety' ? 'safety'
+        : error.code === 'safety' || error.status === 400 ? 'safety'
             : error.code === 'timeout' ? 'timeout'
                 : error.code === 'upstream_error' || error.code === 'connection_error' ? 'upstream'
                     : 'unknown';
     const configured = config.errorImages?.[category] ?? config.errorImages?.unknown;
-    if (!configured) return null;
+    if (!configured) return builtInErrorImage(error);
     const file = path.isAbsolute(configured) ? configured : path.resolve(pluginDirectory, configured);
     try {
         const data = await readFile(file);
         return { data, mime: sniffMime(data), etag: createHash('sha256').update(data).digest('hex'), cached: false, error: true };
     } catch {
-        return null;
+        return builtInErrorImage(error);
     }
 }
 

@@ -72,7 +72,7 @@ test('Gemini SSE adapter reads inline image across standard SSE events', async (
     let capturedUrl;
     const result = await geminiSseAdapter({
         type: 'gemini-sse', url: 'https://gemini.example.test/stream', apiKey: 'secret', queryApiKey: true,
-    }, { prompt: 'cat', width: 512, height: 512, negative: '' }, {
+    }, { prompt: 'cat', width: 512, height: 512, negative: '', model: 'gemini-image' }, {
         fetchImpl: async url => {
             capturedUrl = String(url);
             return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });

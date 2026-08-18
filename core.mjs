@@ -84,7 +84,9 @@ export function sniffMime(data, hint = '') {
     if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
     if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6))) return 'image/gif';
     if (bytes.length >= 12 && bytes.toString('ascii', 4, 8) === 'ftyp' && ['avif', 'avis'].includes(bytes.toString('ascii', 8, 12))) return 'image/avif';
-    throw new PluginError(`Upstream did not return a recognized image${hint ? ` (declared ${String(hint).split(';', 1)[0]})` : ''}`, { code: 'invalid_upstream_response' });
+    const normalizedHint = String(hint).split(';', 1)[0].trim().toLowerCase();
+    if (normalizedHint === 'image/svg+xml' && /<svg[\s>]/i.test(bytes.toString('utf8', 0, Math.min(bytes.length, 512)))) return normalizedHint;
+    throw new PluginError(`Upstream did not return a recognized image${hint ? ` (declared ${normalizedHint})` : ''}`, { code: 'invalid_upstream_response' });
 }
 
 function decodeImage(value, encoding = 'base64') {
@@ -141,7 +143,7 @@ async function checkedFetch(url, options, profile, fetchImpl, activity = {}) {
     if (!response.ok) {
         const text = await response.text().catch(() => '');
         const status = response.status === 429 ? 429 : response.status >= 400 && response.status < 500 ? 400 : 502;
-        const code = response.status === 429 ? 'rate_limit' : /safety|policy|moderation|blocked|filter/i.test(text) ? 'safety' : 'upstream_error';
+        const code = response.status === 429 ? 'rate_limit' : response.status === 400 || /safety|policy|moderation|blocked|filter|bad object/i.test(text) ? 'safety' : 'upstream_error';
         diagnostic({ level: 'error', status: response.status, code });
         throw new PluginError(`Upstream HTTP ${response.status}`, { status, code });
     }
@@ -238,10 +240,22 @@ function parseSse(text) {
 
 export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
     const url = new URL(profile.url);
+    if (!/:streamGenerateContent$/i.test(url.pathname)) {
+        if (!request.model) throw new PluginError('Gemini model is required when using a base URL', { status: 400, code: 'invalid_request' });
+        let basePath = url.pathname.replace(/\/+$/, '');
+        basePath = /\/v1beta$/i.test(basePath) ? basePath : `${basePath}/v1beta`;
+        url.pathname = `${basePath}/models/${encodeURIComponent(request.model)}:streamGenerateContent`.replace(/\/{2,}/g, '/');
+    }
+    url.searchParams.set('alt', 'sse');
     const headers = { 'content-type': 'application/json', accept: 'text/event-stream', ...(profile.headers ?? {}) };
     if (profile.apiKey) {
-        if (profile.queryApiKey !== false) url.searchParams.set('key', profile.apiKey);
-        else headers['x-goog-api-key'] ??= profile.apiKey;
+        if (profile.queryApiKey === true || (profile.queryApiKey === undefined && /(^|\.)generativelanguage\.googleapis\.com$/i.test(url.hostname))) {
+            url.searchParams.set('key', profile.apiKey);
+        } else if (profile.queryApiKey === false) {
+            headers['x-goog-api-key'] ??= profile.apiKey;
+        } else {
+            headers.authorization ??= `Bearer ${profile.apiKey}`;
+        }
     }
     let prompt = request.prompt;
     if (request.width || request.height) prompt = `Generate an image at ${request.width}x${request.height}: ${prompt}`;
@@ -268,7 +282,11 @@ export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, ma
         if (event === '[DONE]') continue;
         let chunk;
         try { chunk = JSON.parse(event); } catch { continue; }
-        if (chunk?.error) throw new PluginError('Gemini returned an error', { code: 'upstream_error' });
+        if (chunk?.error) {
+            const status = Number(chunk.error.code) === 400 ? 400 : 502;
+            const code = status === 400 || /safety|policy|blocked|filter|bad object/i.test(String(chunk.error.message ?? '')) ? 'safety' : 'upstream_error';
+            throw new PluginError(code === 'safety' ? 'Gemini rejected the prompt' : 'Gemini returned an error', { status, code });
+        }
         for (const candidate of chunk?.candidates ?? []) {
             for (const part of candidate?.content?.parts ?? []) {
                 const inline = part.inlineData ?? part.inline_data;
