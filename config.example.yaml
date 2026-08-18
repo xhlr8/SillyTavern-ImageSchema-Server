@@ -8,6 +8,12 @@ limits:
   maxResponseBytes: 52428800
   maxConcurrentRequests: 4
 
+# Optional process-local activity history. Events are strictly allowlisted and
+# never contain prompts, URLs, request/response content, headers, or credentials.
+diagnostics:
+  # Must be 1-200; defaults to 150.
+  limit: 150
+
 cache:
   enabled: true
   # Separate cache directories per authenticated SillyTavern user by default.

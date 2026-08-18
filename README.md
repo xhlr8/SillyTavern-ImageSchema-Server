@@ -326,6 +326,12 @@ Accepts a request, deletes its current canonical entry, regenerates while bypass
 
 Generates with the submitted values, or a small default prompt when none is supplied. Returns JSON metadata (`ok`, profile, MIME, bytes, cached flag, seed), not the image. Cache reads are bypassed.
 
+### Diagnostics routes
+
+`GET /diagnostics/recent?limit=N` returns a bounded, user-scoped activity list and summary. Explicit administrators may request `scope=global`. Events contain only timestamp, level, event/action, sanitized profile name, cache state, duration, status/code, and byte count—never prompts, URLs, headers, bodies, credentials, or raw upstream errors.
+
+`POST /diagnostics/clear` requires explicit administrator status. `{ "scope": "user" }` clears the caller's events; `global` clears all in-memory activity.
+
 ### Provider-management routes
 
 The extension uses `GET /providers/config` plus POST routes `/providers/profile/save`, `/providers/profile/delete`, `/providers/default`, `/providers/secret`, and `/providers/profile/test`. They accept strict allowlisted bodies. Config responses contain sanitized profile data and `apiKeyConfigured` only; secret values are never returned.

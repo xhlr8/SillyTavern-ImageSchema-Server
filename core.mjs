@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
+import { recordDiagnostic } from './diagnostics.mjs';
+
 export class PluginError extends Error {
     constructor(message, { status = 502, code = 'upstream_error', cause } = {}) {
         super(message, { cause });
@@ -111,7 +113,16 @@ function combineSignal(timeoutMs, externalSignal) {
     return externalSignal ? AbortSignal.any([timeoutSignal, externalSignal]) : timeoutSignal;
 }
 
-async function checkedFetch(url, options, profile, fetchImpl) {
+async function checkedFetch(url, options, profile, fetchImpl, activity = {}) {
+    const startedAt = Date.now();
+    const diagnostic = fields => recordDiagnostic(activity.diagnostics, {
+        event: 'upstream.request',
+        action: String(options.method ?? 'GET').toLowerCase(),
+        profile: activity.profile,
+        scope: activity.scope,
+        durationMs: Date.now() - startedAt,
+        ...fields,
+    });
     let response;
     try {
         response = await fetchImpl(url, {
@@ -121,16 +132,20 @@ async function checkedFetch(url, options, profile, fetchImpl) {
         });
     } catch (error) {
         if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+            diagnostic({ level: 'error', status: 504, code: 'timeout' });
             throw new PluginError('Upstream image request timed out', { status: 504, code: 'timeout', cause: error });
         }
+        diagnostic({ level: 'error', status: 502, code: 'connection_error' });
         throw new PluginError('Upstream image request failed', { status: 502, code: 'connection_error', cause: error });
     }
     if (!response.ok) {
         const text = await response.text().catch(() => '');
         const status = response.status === 429 ? 429 : response.status >= 400 && response.status < 500 ? 400 : 502;
         const code = response.status === 429 ? 'rate_limit' : /safety|policy|moderation|blocked|filter/i.test(text) ? 'safety' : 'upstream_error';
+        diagnostic({ level: 'error', status: response.status, code });
         throw new PluginError(`Upstream HTTP ${response.status}`, { status, code });
     }
+    diagnostic({ status: response.status });
     return response;
 }
 
@@ -166,7 +181,7 @@ async function responseJson(response, maxBytes, label) {
     }
 }
 
-export async function openAiAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal } = {}) {
+export async function openAiAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
     const format = String(request.outputFormat ?? profile.defaults?.outputFormat ?? 'png').replace(/^image\//, '');
     const body = {
         ...(profile.body ?? {}),
@@ -181,9 +196,10 @@ export async function openAiAdapter(profile, request, { fetchImpl = fetch, maxBy
     for (const key of Object.keys(body)) if (body[key] === undefined || body[key] === '') delete body[key];
     const headers = { 'content-type': 'application/json', accept: 'application/json', ...(profile.headers ?? {}) };
     if (profile.apiKey) headers.authorization ??= `Bearer ${profile.apiKey}`;
-    const response = await checkedFetch(profile.url, { method: 'POST', headers, body: JSON.stringify(body), signal }, profile, fetchImpl);
+    const activity = { diagnostics, scope, profile: profileName };
+    const response = await checkedFetch(profile.url, { method: 'POST', headers, body: JSON.stringify(body), signal }, profile, fetchImpl, activity);
     const json = await responseJson(response, maxBytes, 'OpenAI');
-    if (json?.error) throw new PluginError(`OpenAI error: ${json.error.message ?? JSON.stringify(json.error).slice(0, 500)}`, { code: 'upstream_error' });
+    if (json?.error) throw new PluginError('OpenAI returned an error', { code: 'upstream_error' });
     const first = json?.data?.[0];
     if (first?.b64_json) {
         const data = Buffer.from(first.b64_json, 'base64');
@@ -198,7 +214,7 @@ export async function openAiAdapter(profile, request, { fetchImpl = fetch, maxBy
         } catch {
             throw new PluginError('OpenAI returned an invalid image URL', { code: 'invalid_upstream_response' });
         }
-        const imageResponse = await checkedFetch(imageUrl, { method: 'GET', headers: { accept: 'image/*' }, signal }, profile, fetchImpl);
+        const imageResponse = await checkedFetch(imageUrl, { method: 'GET', headers: { accept: 'image/*' }, signal }, profile, fetchImpl, activity);
         const data = await responseBuffer(imageResponse, maxBytes);
         return { data, mime: sniffMime(data, imageResponse.headers.get('content-type')) };
     }
@@ -220,7 +236,7 @@ function parseSse(text) {
     return events;
 }
 
-export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal } = {}) {
+export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
     const url = new URL(profile.url);
     const headers = { 'content-type': 'application/json', accept: 'text/event-stream', ...(profile.headers ?? {}) };
     if (profile.apiKey) {
@@ -246,13 +262,13 @@ export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, ma
         },
     };
     if (profile.systemInstruction) body.systemInstruction = { parts: [{ text: profile.systemInstruction }] };
-    const response = await checkedFetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal }, profile, fetchImpl);
+    const response = await checkedFetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal }, profile, fetchImpl, { diagnostics, scope, profile: profileName });
     const raw = (await responseBuffer(response, maxBytes)).toString('utf8');
     for (const event of parseSse(raw)) {
         if (event === '[DONE]') continue;
         let chunk;
         try { chunk = JSON.parse(event); } catch { continue; }
-        if (chunk?.error) throw new PluginError(`Gemini error: ${chunk.error.message ?? JSON.stringify(chunk.error).slice(0, 500)}`, { code: 'upstream_error' });
+        if (chunk?.error) throw new PluginError('Gemini returned an error', { code: 'upstream_error' });
         for (const candidate of chunk?.candidates ?? []) {
             for (const part of candidate?.content?.parts ?? []) {
                 const inline = part.inlineData ?? part.inline_data;
@@ -270,7 +286,7 @@ export async function geminiSseAdapter(profile, request, { fetchImpl = fetch, ma
     throw new PluginError('Gemini SSE response contained no image', { code: 'invalid_upstream_response' });
 }
 
-export async function genericAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal } = {}) {
+export async function genericAdapter(profile, request, { fetchImpl = fetch, maxBytes = 50 * 1024 * 1024, signal, diagnostics, scope, profileName = request.profile } = {}) {
     const method = String(profile.method ?? 'GET').toUpperCase();
     if (!['GET', 'POST'].includes(method)) throw new PluginError(`Generic profile method must be GET or POST`, { status: 500, code: 'config_error' });
     const renderedUrl = renderTemplate(profile.url, request, { encodePrompt: true });
@@ -284,7 +300,8 @@ export async function genericAdapter(profile, request, { fetchImpl = fetch, maxB
         headers['content-type'] ??= 'application/json';
         options.body = JSON.stringify(renderTemplate(profile.body ?? {}, request));
     }
-    const response = await checkedFetch(url, options, profile, fetchImpl);
+    const activity = { diagnostics, scope, profile: profileName };
+    const response = await checkedFetch(url, options, profile, fetchImpl, activity);
     if (!profile.responseImagePath) {
         const data = await responseBuffer(response, maxBytes);
         return { data, mime: sniffMime(data, response.headers.get('content-type')) };
@@ -293,7 +310,7 @@ export async function genericAdapter(profile, request, { fetchImpl = fetch, maxB
     const value = getJsonPath(json, profile.responseImagePath);
     const decoded = decodeImage(value, profile.responseEncoding ?? 'base64');
     if (typeof decoded === 'string') {
-        const imageResponse = await checkedFetch(decoded, { method: 'GET', headers: { accept: 'image/*' }, signal }, profile, fetchImpl);
+        const imageResponse = await checkedFetch(decoded, { method: 'GET', headers: { accept: 'image/*' }, signal }, profile, fetchImpl, activity);
         const data = await responseBuffer(imageResponse, maxBytes);
         return { data, mime: sniffMime(data, imageResponse.headers.get('content-type')) };
     }
@@ -488,10 +505,12 @@ export class DiskCache {
 }
 
 export class ImageService {
-    constructor(config, { cache, fetchImpl = fetch } = {}) {
+    constructor(config, { cache, fetchImpl = fetch, diagnostics = null, scope = 'anonymous' } = {}) {
         this.config = validateConfig(config);
         this.cache = cache;
         this.fetchImpl = fetchImpl;
+        this.diagnostics = diagnostics;
+        this.scope = scope;
         this.inflight = new Map();
     }
 
@@ -513,23 +532,56 @@ export class ImageService {
         return { ...normalized, key };
     }
 
-    async generate(input, { bypassCache = false, signal } = {}) {
-        const prepared = this.prepare(input);
-        if (!bypassCache) {
-            const hit = await this.cache?.get(prepared.key);
-            if (hit) return { ...hit, key: prepared.key, request: prepared.request };
+    async generate(input, { bypassCache = false, signal, action = 'generate' } = {}) {
+        const startedAt = Date.now();
+        let prepared;
+        try {
+            prepared = this.prepare(input);
+        } catch (error) {
+            this.#record({ level: 'error', event: 'generation.complete', action, status: error?.status ?? 500, code: error?.code ?? 'internal_error', durationMs: Date.now() - startedAt });
+            throw error;
         }
-        if (this.inflight.has(prepared.key)) return this.inflight.get(prepared.key);
-        const maxConcurrent = Number(this.config.limits?.maxConcurrentRequests ?? 4);
-        if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) throw new PluginError('limits.maxConcurrentRequests must be a positive integer', { status: 500, code: 'config_error' });
-        if (this.inflight.size >= maxConcurrent) throw new PluginError('Too many image requests are already running', { status: 429, code: 'rate_limit' });
-        const operation = this.#generateOwned(prepared, signal).finally(() => this.inflight.delete(prepared.key));
-        this.inflight.set(prepared.key, operation);
-        return operation;
+        const detail = { action, profile: prepared.request.profile };
+        try {
+            if (!bypassCache) {
+                const hit = await this.cache?.get(prepared.key);
+                if (hit) {
+                    this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: hit.data.length });
+                    this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: hit.data.length, durationMs: Date.now() - startedAt });
+                    return { ...hit, key: prepared.key, request: prepared.request };
+                }
+                this.#record({ event: 'cache.lookup', ...detail, cache: 'miss' });
+            } else {
+                this.#record({ event: 'cache.lookup', ...detail, cache: 'bypass' });
+            }
+            if (this.inflight.has(prepared.key)) {
+                const result = await this.inflight.get(prepared.key);
+                this.#record({ event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'miss', status: 200, bytes: result.data.length, durationMs: Date.now() - startedAt });
+                return result;
+            }
+            const maxConcurrent = Number(this.config.limits?.maxConcurrentRequests ?? 4);
+            if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) throw new PluginError('limits.maxConcurrentRequests must be a positive integer', { status: 500, code: 'config_error' });
+            if (this.inflight.size >= maxConcurrent) throw new PluginError('Too many image requests are already running', { status: 429, code: 'rate_limit' });
+            const operation = this.#generateOwned(prepared, signal).finally(() => this.inflight.delete(prepared.key));
+            this.inflight.set(prepared.key, operation);
+            const result = await operation;
+            this.#record({ event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'miss', status: 200, bytes: result.data.length, durationMs: Date.now() - startedAt });
+            return result;
+        } catch (error) {
+            this.#record({ level: 'error', event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'error', status: error?.status ?? 500, code: error?.code ?? 'internal_error', durationMs: Date.now() - startedAt });
+            throw error;
+        }
     }
 
     async #generateOwned(prepared, signal) {
-        const options = { fetchImpl: this.fetchImpl, maxBytes: Number(this.config.limits?.maxResponseBytes ?? 50 * 1024 * 1024), signal };
+        const options = {
+            fetchImpl: this.fetchImpl,
+            maxBytes: Number(this.config.limits?.maxResponseBytes ?? 50 * 1024 * 1024),
+            signal,
+            diagnostics: this.diagnostics,
+            scope: this.scope,
+            profileName: prepared.request.profile,
+        };
         let result;
         switch (prepared.profile.type) {
             case 'openai': result = await openAiAdapter(prepared.profile, prepared.request, options); break;
@@ -539,5 +591,9 @@ export class ImageService {
         }
         const entry = this.cache ? await this.cache.set(prepared.key, result) : { ...result, etag: createHash('sha256').update(result.data).digest('hex'), cached: false };
         return { ...entry, key: prepared.key, request: prepared.request };
+    }
+
+    #record(event) {
+        recordDiagnostic(this.diagnostics, { scope: this.scope, ...event });
     }
 }

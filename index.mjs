@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 
 import { DiskCache, ImageService, PluginError, expandEnv, sniffMime, validateConfig } from './core.mjs';
+import { ActivityDiagnostics, diagnosticsContract, diagnosticsScope, isDiagnosticsAdmin, recordDiagnostic } from './diagnostics.mjs';
 import { ManagedProfileStore, profilesPublicView, validateManagedProfile, validateProfileName } from './managed-config.mjs';
 
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -129,6 +130,13 @@ function requireAdmin(request, _response, next) {
     return next();
 }
 
+function requireExplicitAdmin(request, _response, next) {
+    if (!isDiagnosticsAdmin(request)) {
+        return next(new PluginError('Administrator access is required', { status: 403, code: 'forbidden' }));
+    }
+    return next();
+}
+
 function contractProfile(input) {
     const source = exactObject(input, 'profile');
     const allowed = new Set(['name', 'type', 'url', 'method', 'model', 'allowedModels', 'timeoutMs', 'defaults']);
@@ -168,6 +176,7 @@ export async function init(router) {
     const configuredCacheDirectory = path.isAbsolute(cacheDirectorySetting) ? cacheDirectorySetting : path.resolve(pluginDirectory, cacheDirectorySetting);
     const caches = new Map();
     const services = new Map();
+    const diagnostics = new ActivityDiagnostics({ limit: Number(baseConfig.diagnostics?.limit ?? diagnosticsContract.defaultLimit) });
     let config;
     const store = new ManagedProfileStore({
         baseConfig,
@@ -180,22 +189,24 @@ export async function init(router) {
     });
     config = await store.load();
     const getUserState = async request => {
-        const handle = String(request.user?.profile?.handle ?? 'default').replace(/[^A-Za-z0-9_-]/g, '_');
-        if (!caches.has(handle)) {
-            const directory = config.cache?.perUser === false ? configuredCacheDirectory : path.join(configuredCacheDirectory, handle);
+        const scope = diagnosticsScope(request);
+        if (!caches.has(scope)) {
+            const directoryName = scope.slice(0, 32);
+            const directory = config.cache?.perUser === false ? configuredCacheDirectory : path.join(configuredCacheDirectory, directoryName);
             const cache = new DiskCache({ directory, enabled: config.cache?.enabled !== false, ttlSeconds: config.cache?.ttlSeconds ?? null });
             await cache.init();
-            caches.set(handle, cache);
-            services.set(handle, new ImageService(config, { cache }));
+            caches.set(scope, cache);
+            services.set(scope, new ImageService(config, { cache, diagnostics, scope }));
         }
-        return { cache: caches.get(handle), service: services.get(handle) };
+        return { cache: caches.get(scope), service: services.get(scope), scope };
     };
-    state = { config, baseConfig, configPath, managedPath, store, caches, services };
+    const routeEvent = (request, event) => recordDiagnostic(diagnostics, { scope: diagnosticsScope(request), ...event });
+    state = { config, baseConfig, configPath, managedPath, store, caches, services, diagnostics };
 
     router.get('/image/:prompt(*)', asyncRoute(async (request, response) => {
         try {
             const { service } = await getUserState(request);
-            const result = await service.generate(generationInput(request, true));
+            const result = await service.generate(generationInput(request, true), { action: 'image' });
             return sendImage(request, response, result, config);
         } catch (rawError) {
             const error = rawError instanceof PluginError ? rawError : new PluginError('Image generation failed', { cause: rawError });
@@ -211,7 +222,7 @@ export async function init(router) {
 
     router.post('/generate', asyncRoute(async (request, response) => {
         const { service } = await getUserState(request);
-        const result = await service.generate(generationInput(request));
+        const result = await service.generate(generationInput(request), { action: 'generate' });
         return sendImage(request, response, result, config);
     }));
 
@@ -220,24 +231,30 @@ export async function init(router) {
     // Compatibility route used by existing clients; it remains read-only despite POST.
     router.post('/profiles', (_request, response) => response.json(profilesPublicView(config)));
 
-    router.get('/providers/config', (_request, response) => response.json(contractConfigView(store.view())));
+    router.get('/providers/config', (request, response) => {
+        routeEvent(request, { event: 'provider.config', action: 'read', status: 200 });
+        return response.json(contractConfigView(store.view()));
+    });
     router.post('/providers/profile/save', requireAdmin, asyncRoute(async (request, response) => {
         const body = exactBody(request, new Set(['profile', 'previousName']));
         const { name, profile } = contractProfile(body.profile);
         const previousName = body.previousName === undefined ? name : validateProfileName(body.previousName);
         await store.save(name, profile, previousName);
+        routeEvent(request, { event: 'provider.profile', action: 'save', profile: name, status: 200 });
         return response.json({ ok: true, name });
     }));
     router.post('/providers/profile/delete', requireAdmin, asyncRoute(async (request, response) => {
         const body = exactBody(request, new Set(['name']));
         const name = validateProfileName(body.name);
         await store.delete(name);
+        routeEvent(request, { event: 'provider.profile', action: 'delete', profile: name, status: 200 });
         return response.json({ ok: true, name });
     }));
     router.post('/providers/default', requireAdmin, asyncRoute(async (request, response) => {
         const body = exactBody(request, new Set(['name']));
         const name = validateProfileName(body.name);
         await store.setDefault(name);
+        routeEvent(request, { event: 'provider.default', action: 'set', profile: name, status: 200 });
         return response.json({ ok: true, defaultProfile: name });
     }));
     router.post('/providers/secret', requireAdmin, asyncRoute(async (request, response) => {
@@ -255,6 +272,7 @@ export async function init(router) {
                 : { apiKey: body.apiKey };
             await store.replaceSecret(name, secret);
         }
+        routeEvent(request, { event: 'provider.secret', action: body.clear === true ? 'clear' : 'replace', profile: name, status: 200 });
         return response.json({ ok: true, name, apiKeyConfigured: body.clear !== true });
     }));
     router.post('/providers/profile/test', requireAdmin, asyncRoute(async (request, response) => {
@@ -269,36 +287,46 @@ export async function init(router) {
             : {};
         const testProfile = { ...profile, ...inheritedSecret };
         const testConfig = validateConfig({ ...structuredClone(config), defaultProfile: name, profiles: { ...structuredClone(config.profiles), [name]: testProfile } });
-        const testService = new ImageService(testConfig, { cache: null });
+        const testService = new ImageService(testConfig, { cache: null, diagnostics, scope: diagnosticsScope(request) });
         const prompt = body.prompt === undefined ? 'A small red circle on a plain white background' : body.prompt;
         if (typeof prompt !== 'string' || !prompt.trim()) throw new PluginError('prompt must be a non-empty string', { status: 400, code: 'invalid_request' });
-        const result = await testService.generate({ profile: name, prompt }, { bypassCache: true });
+        const result = await testService.generate({ profile: name, prompt }, { bypassCache: true, action: 'provider-test' });
         return response.json({ ok: true, profile: name, mime: result.mime, bytes: result.data.length });
     }));
 
     router.post('/cache/stats', asyncRoute(async (request, response) => {
         const { cache, service } = await getUserState(request);
-        return response.json({ ...(await cache.stats()), inflight: service.inflight.size });
+        const result = { ...(await cache.stats()), inflight: service.inflight.size };
+        routeEvent(request, { event: 'cache.manage', action: 'stats', status: 200, bytes: result.bytes });
+        return response.json(result);
     }));
     router.post('/cache/clear', asyncRoute(async (request, response) => {
         const { cache, service } = await getUserState(request);
-        if (request.body?.all === true || !request.body?.request) return response.json(await cache.clear());
-        const prepared = service.prepare(generationInput(request));
-        return response.json(await cache.delete(prepared.key));
+        let result;
+        let profile;
+        if (request.body?.all === true || !request.body?.request) {
+            result = await cache.clear();
+        } else {
+            const prepared = service.prepare(generationInput(request));
+            profile = prepared.request.profile;
+            result = await cache.delete(prepared.key);
+        }
+        routeEvent(request, { event: 'cache.manage', action: 'clear', profile, status: 200 });
+        return response.json(result);
     }));
     router.post('/cache/regenerate', asyncRoute(async (request, response) => {
         const { cache, service } = await getUserState(request);
         const input = generationInput(request);
         const prepared = service.prepare(input);
         await cache.delete(prepared.key);
-        const result = await service.generate(input, { bypassCache: true });
+        const result = await service.generate(input, { bypassCache: true, action: 'cache-regenerate' });
         return response.json({ ok: true, key: result.key, profile: result.request.profile, seed: result.request.seed, mime: result.mime, bytes: result.data.length });
     }));
     router.post('/test', asyncRoute(async (request, response) => {
         const { service } = await getUserState(request);
         const input = generationInput(request);
         if (!input.prompt) input.prompt = 'A small red circle on a plain white background';
-        const result = await service.generate(input, { bypassCache: true });
+        const result = await service.generate(input, { bypassCache: true, action: 'test' });
         return response.json({
             ok: true,
             profile: result.request.profile,
@@ -309,9 +337,29 @@ export async function init(router) {
         });
     }));
 
+    router.get('/diagnostics/recent', (request, response) => {
+        const adminGlobal = isDiagnosticsAdmin(request) && String(request.query?.scope ?? '').toLowerCase() === 'global';
+        const scope = diagnosticsScope(request);
+        return response.json({
+            scope: adminGlobal ? 'global' : 'user',
+            limit: diagnostics.limit,
+            events: diagnostics.recent({ scope, global: adminGlobal, limit: request.query?.limit }),
+            summary: diagnostics.summary({ scope, global: adminGlobal }),
+        });
+    });
+    router.post('/diagnostics/clear', requireExplicitAdmin, asyncRoute(async (request, response) => {
+        const userOnly = request.body?.scope === 'user';
+        if (request.body?.scope !== undefined && !['user', 'global'].includes(request.body.scope)) {
+            throw new PluginError('scope must be user or global', { status: 400, code: 'invalid_request' });
+        }
+        const removed = diagnostics.clear({ scope: diagnosticsScope(request), global: !userOnly });
+        return response.json({ ok: true, scope: userOnly ? 'user' : 'global', removed });
+    }));
+
     router.use((error, request, response, _next) => {
         const normalized = error instanceof PluginError ? error : new PluginError('Internal image server error', { status: 500, code: 'internal_error', cause: error });
-        console.error(`[${info.id}] ${request.method} ${request.path}:`, normalized.code, normalized.message);
+        routeEvent(request, { level: 'error', event: 'route.error', action: String(request.method ?? '').toLowerCase(), status: normalized.status, code: normalized.code });
+        console.error(`[${info.id}] request failed`, { method: request.method, path: request.route?.path ?? 'unknown', status: normalized.status, code: normalized.code });
         if (response.headersSent) return response.end();
         return response.status(normalized.status).json({ error: { code: normalized.code, message: normalized.message } });
     });
