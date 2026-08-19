@@ -60,6 +60,7 @@ test('instructionPrompt is accepted for every managed profile type with a strict
     ];
     for (const profile of profiles) {
         assert.equal(validateManagedProfile({ ...profile, instructionPrompt: prompt }).instructionPrompt, prompt);
+        assert.equal(validateManagedProfile({ ...profile, instructionPrompt: 'x'.repeat(20_000) }).instructionPrompt.length, 20_000);
         assert.throws(() => validateManagedProfile({ ...profile, instructionPrompt: 42 }), /instructionPrompt must be a string/);
         assert.throws(() => validateManagedProfile({ ...profile, instructionPrompt: 'x'.repeat(20_001) }), /instructionPrompt must be a string/);
     }

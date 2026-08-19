@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
     DiskCache,
     ImageService,
+    OutputStore,
     canonicalize,
     expandEnv,
     fingerprint,
@@ -208,6 +209,138 @@ test('ImageService deduplicates seedless requests and preserves the first random
     assert.equal(reloaded.cached, true);
     assert.equal(reloaded.etag, a.etag);
     assert.equal(calls, 1);
+});
+
+test('durable outputs are authoritative across service/cache instances and isolated by user directory', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-outputs-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const config = {
+        defaultProfile: 'fixed',
+        cache: { enabled: true },
+        profiles: {
+            fixed: { type: 'generic', method: 'GET', url: 'https://fixed.test/image', defaults: { width: 512, height: 512 } },
+        },
+    };
+    const userOneOutputs = path.join(root, 'outputs', 'user-one');
+    let calls = 0;
+    const firstService = new ImageService(config, {
+        cache: new DiskCache({ directory: path.join(root, 'cache-one') }),
+        outputs: new OutputStore({ directory: userOneOutputs }),
+        fetchImpl: async () => {
+            calls++;
+            return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } });
+        },
+    });
+    const first = await firstService.generate({ prompt: 'same request', seed: 0 });
+    assert.equal(calls, 1);
+
+    const freshService = new ImageService(config, {
+        cache: new DiskCache({ directory: path.join(root, 'fresh-cache') }),
+        outputs: new OutputStore({ directory: userOneOutputs }),
+        fetchImpl: async () => { throw new Error('durable output should avoid provider'); },
+    });
+    const reused = await freshService.generate({ prompt: 'same request', seed: 0 }, { bypassCache: true });
+    assert.equal(reused.key, first.key);
+    assert.equal(reused.etag, first.etag);
+    assert.equal(reused.cached, true);
+
+    const metadata = JSON.parse(await readFile(path.join(userOneOutputs, `${first.key}.json`), 'utf8'));
+    assert.equal(metadata.key, first.key);
+    assert.equal(metadata.mime, 'image/png');
+    assert.equal(metadata.profile, 'fixed');
+    assert.equal(metadata.seed, 0);
+    assert.equal(metadata.params.prompt, undefined);
+    assert.equal(metadata.prompt, undefined);
+    assert.equal(metadata.promptHash, fingerprint('same request'));
+    assert.deepEqual(await readFile(path.join(userOneOutputs, `${first.key}.png`)), PNG);
+
+    let otherUserCalls = 0;
+    const otherUser = new ImageService(config, {
+        cache: new DiskCache({ directory: path.join(root, 'cache-two') }),
+        outputs: new OutputStore({ directory: path.join(root, 'outputs', 'user-two') }),
+        fetchImpl: async () => {
+            otherUserCalls++;
+            return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } });
+        },
+    });
+    await otherUser.generate({ prompt: 'same request', seed: 0 });
+    assert.equal(otherUserCalls, 1);
+});
+
+test('OutputStore rejects keys that could escape its configured directory', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'st-image-output-key-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const outputs = new OutputStore({ directory });
+    await assert.rejects(outputs.get('../outside'), /Invalid output key/);
+    await assert.rejects(outputs.delete('../outside'), /Invalid output key/);
+});
+
+test('request key changes with seed, selected profile, and Comfy workflow', () => {
+    const genericProfile = { type: 'generic', method: 'GET', url: 'https://fixed.test/image', defaults: { width: 512, height: 512 } };
+    const config = {
+        defaultProfile: 'one',
+        profiles: {
+            one: genericProfile,
+            two: { ...genericProfile, url: 'https://other.test/image' },
+            workflow: {
+                type: 'comfyui', url: 'https://comfy.test',
+                workflow: {
+                    1: { class_type: 'Text', inputs: { text: 'placeholder' } },
+                    2: { class_type: 'SaveImage', inputs: {} },
+                },
+                bindings: { prompt: { node: '1', input: 'text' } },
+                outputNode: '2', defaults: { width: 512, height: 512 },
+            },
+        },
+    };
+    const service = new ImageService(config, { cache: null });
+    const base = service.prepare({ prompt: 'cat', profile: 'one', seed: 1 }).key;
+    assert.notEqual(base, service.prepare({ prompt: 'cat', profile: 'one', seed: 2 }).key);
+    assert.notEqual(base, service.prepare({ prompt: 'cat', profile: 'two', seed: 1 }).key);
+    const workflowKey = service.prepare({ prompt: 'cat', profile: 'workflow', seed: 1 }).key;
+    const changed = structuredClone(config);
+    changed.profiles.workflow.workflow['1'].class_type = 'DifferentText';
+    const changedService = new ImageService(changed, { cache: null });
+    assert.notEqual(workflowKey, changedService.prepare({ prompt: 'cat', profile: 'workflow', seed: 1 }).key);
+});
+
+test('legacy DiskCache hits are promoted to durable outputs without provider generation', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-promote-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const cache = new DiskCache({ directory: path.join(root, 'cache') });
+    const outputs = new OutputStore({ directory: path.join(root, 'outputs') });
+    const config = { defaultProfile: 'p', profiles: { p: { type: 'generic', url: 'https://fixed.test', defaults: {} } } };
+    const service = new ImageService(config, { cache, outputs, fetchImpl: async () => { throw new Error('provider must not run'); } });
+    const prepared = service.prepare({ prompt: 'legacy cat' });
+    await cache.set(prepared.key, { data: PNG, mime: 'image/png' });
+    const result = await service.generate({ prompt: 'legacy cat' });
+    assert.equal(result.durable, true);
+    assert.equal((await outputs.stats()).entries, 1);
+    assert.deepEqual(result.data, PNG);
+});
+
+test('clearing internal cache leaves durable output reusable until explicitly cleared', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-clear-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const cache = new DiskCache({ directory: path.join(root, 'cache') });
+    const outputs = new OutputStore({ directory: path.join(root, 'outputs') });
+    const config = { defaultProfile: 'p', profiles: { p: { type: 'generic', url: 'https://fixed.test', defaults: {} } } };
+    let calls = 0;
+    const service = new ImageService(config, {
+        cache, outputs,
+        fetchImpl: async () => {
+            calls++;
+            return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } });
+        },
+    });
+    const first = await service.generate({ prompt: 'cat' });
+    await cache.clear();
+    assert.equal((await outputs.stats()).entries, 1);
+    const reused = await service.generate({ prompt: 'cat' });
+    assert.equal(reused.key, first.key);
+    assert.equal(calls, 1);
+    await outputs.clear();
+    assert.equal((await outputs.stats()).entries, 0);
 });
 
 test('MIME sniffing recognizes PNG and does not trust non-image hints', () => {

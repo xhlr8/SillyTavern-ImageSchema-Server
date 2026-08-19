@@ -25,6 +25,17 @@ cache:
   # number only when expiration is explicitly desired.
   ttlSeconds: null
 
+# Authoritative generated image bytes. Unlike the internal cache, these outputs
+# have no TTL and are not removed by /cache/clear. When cache.perUser is true,
+# each authenticated SillyTavern user receives a separate hashed subdirectory.
+outputs:
+  enabled: true
+  # Relative paths are resolved from this plugin directory.
+  directory: ./outputs
+  # Prompts are omitted from metadata by default; only a SHA-256 promptHash is
+  # stored alongside sanitized effective generation parameters.
+  includePrompt: false
+
 # Optional images returned by GET /image on errors. These may point outside the
 # plugin, such as the existing image-server/static/error_images directory.
 errorImages:
@@ -40,6 +51,10 @@ profiles:
     url: https://api.openai.com/v1/images/generations
     apiKey: ${OPENAI_API_KEY}
     model: gpt-image-1
+    # Optional UI/editor instructions associated with this profile. This value is
+    # returned by the managed config API but is never sent to the image provider.
+    instructionPrompt: |
+      Describe the requested image using the Image Schema format.
     timeoutMs: 180000
     defaults:
       width: 1024

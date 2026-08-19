@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 
-import { DiskCache, ImageService, PluginError, expandEnv, sniffMime, validateConfig } from './core.mjs';
+import { DiskCache, ImageService, OutputStore, PluginError, expandEnv, sniffMime, validateConfig } from './core.mjs';
 import { ActivityDiagnostics, diagnosticsContract, diagnosticsScope, isDiagnosticsAdmin, recordDiagnostic } from './diagnostics.mjs';
 import { ManagedProfileStore, profilesPublicView, validateManagedProfile, validateProfileName } from './managed-config.mjs';
 import { analyzeComfyWorkflow, validateComfyWorkflow } from './comfyui.mjs';
@@ -248,7 +248,10 @@ export async function init(router) {
     const managedPath = path.isAbsolute(managedSetting) ? managedSetting : path.resolve(pluginDirectory, managedSetting);
     const cacheDirectorySetting = baseConfig.cache?.directory ?? './cache';
     const configuredCacheDirectory = path.isAbsolute(cacheDirectorySetting) ? cacheDirectorySetting : path.resolve(pluginDirectory, cacheDirectorySetting);
+    const outputDirectorySetting = baseConfig.outputs?.directory ?? './outputs';
+    const configuredOutputDirectory = path.isAbsolute(outputDirectorySetting) ? outputDirectorySetting : path.resolve(pluginDirectory, outputDirectorySetting);
     const caches = new Map();
+    const outputs = new Map();
     const services = new Map();
     const diagnostics = new ActivityDiagnostics({ limit: Number(baseConfig.diagnostics?.limit ?? diagnosticsContract.defaultLimit) });
     let config;
@@ -265,17 +268,23 @@ export async function init(router) {
     const getUserState = async request => {
         const scope = diagnosticsScope(request);
         if (!caches.has(scope)) {
-            const directoryName = scope.slice(0, 32);
-            const directory = config.cache?.perUser === false ? configuredCacheDirectory : path.join(configuredCacheDirectory, directoryName);
-            const cache = new DiskCache({ directory, enabled: config.cache?.enabled !== false, ttlSeconds: config.cache?.ttlSeconds ?? null });
-            await cache.init();
+            const cacheDirectory = config.cache?.perUser === false ? configuredCacheDirectory : path.join(configuredCacheDirectory, scope);
+            const outputDirectory = config.cache?.perUser === false ? configuredOutputDirectory : path.join(configuredOutputDirectory, scope);
+            const cache = new DiskCache({ directory: cacheDirectory, enabled: config.cache?.enabled !== false, ttlSeconds: config.cache?.ttlSeconds ?? null });
+            const outputStore = new OutputStore({
+                directory: outputDirectory,
+                enabled: config.outputs?.enabled !== false,
+                includePrompt: config.outputs?.includePrompt === true,
+            });
+            await Promise.all([cache.init(), outputStore.init()]);
             caches.set(scope, cache);
-            services.set(scope, new ImageService(config, { cache, diagnostics, scope }));
+            outputs.set(scope, outputStore);
+            services.set(scope, new ImageService(config, { cache, outputs: outputStore, diagnostics, scope }));
         }
-        return { cache: caches.get(scope), service: services.get(scope), scope };
+        return { cache: caches.get(scope), outputs: outputs.get(scope), service: services.get(scope), scope };
     };
     const routeEvent = (request, event) => recordDiagnostic(diagnostics, { scope: diagnosticsScope(request), ...event });
-    state = { config, baseConfig, configPath, managedPath, store, caches, services, diagnostics };
+    state = { config, baseConfig, configPath, managedPath, store, caches, outputs, services, diagnostics };
 
     router.get('/image/:prompt(*)', asyncRoute(async (request, response) => {
         try {
@@ -422,8 +431,37 @@ export async function init(router) {
         const input = generationInput(request);
         const prepared = service.prepare(input);
         await cache.delete(prepared.key);
+        // Outputs remain authoritative: this warms internal cache from durable
+        // bytes rather than silently replacing an existing generated artifact.
         const result = await service.generate(input, { bypassCache: true, action: 'cache-regenerate' });
         return response.json({ ok: true, key: result.key, profile: result.request.profile, seed: result.request.seed, mime: result.mime, bytes: result.data.length });
+    }));
+    router.get('/outputs/stats', asyncRoute(async (request, response) => {
+        const { outputs: outputStore } = await getUserState(request);
+        const result = await outputStore.stats();
+        routeEvent(request, { event: 'output.manage', action: 'stats', status: 200, bytes: result.bytes });
+        return response.json(result);
+    }));
+    router.post('/outputs/stats', asyncRoute(async (request, response) => {
+        const { outputs: outputStore } = await getUserState(request);
+        const result = await outputStore.stats();
+        routeEvent(request, { event: 'output.manage', action: 'stats', status: 200, bytes: result.bytes });
+        return response.json(result);
+    }));
+    router.post('/outputs/clear', asyncRoute(async (request, response) => {
+        const { outputs: outputStore, cache, service } = await getUserState(request);
+        let result;
+        let profile;
+        if (request.body?.all === true || !request.body?.request) {
+            result = await outputStore.clear();
+        } else {
+            const prepared = service.prepare(generationInput(request));
+            profile = prepared.request.profile;
+            result = await outputStore.delete(prepared.key);
+            await cache.delete(prepared.key);
+        }
+        routeEvent(request, { event: 'output.manage', action: 'clear', profile, status: 200 });
+        return response.json(result);
     }));
     router.post('/test', asyncRoute(async (request, response) => {
         const { service } = await getUserState(request);

@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { recordDiagnostic } from './diagnostics.mjs';
@@ -586,6 +586,12 @@ export function profilePublicView(name, profile, isDefault = false) {
 
 export function validateConfig(config) {
     if (!config || typeof config !== 'object') throw new PluginError('Configuration root must be an object', { status: 500, code: 'config_error' });
+    if (config.outputs !== undefined) {
+        if (!config.outputs || typeof config.outputs !== 'object' || Array.isArray(config.outputs)) throw new PluginError('outputs must be an object', { status: 500, code: 'config_error' });
+        if (config.outputs.directory !== undefined && (typeof config.outputs.directory !== 'string' || !config.outputs.directory.trim())) throw new PluginError('outputs.directory must be a non-empty string', { status: 500, code: 'config_error' });
+        if (config.outputs.enabled !== undefined && typeof config.outputs.enabled !== 'boolean') throw new PluginError('outputs.enabled must be boolean', { status: 500, code: 'config_error' });
+        if (config.outputs.includePrompt !== undefined && typeof config.outputs.includePrompt !== 'boolean') throw new PluginError('outputs.includePrompt must be boolean', { status: 500, code: 'config_error' });
+    }
     if (!config.profiles || typeof config.profiles !== 'object' || !Object.keys(config.profiles).length) throw new PluginError('At least one profile is required', { status: 500, code: 'config_error' });
     if (!config.defaultProfile) config.defaultProfile = Object.keys(config.profiles)[0];
     if (!config.profiles[config.defaultProfile]) throw new PluginError(`Default profile does not exist: ${config.defaultProfile}`, { status: 500, code: 'config_error' });
@@ -698,10 +704,187 @@ export class DiskCache {
     }
 }
 
+const MIME_EXTENSIONS = Object.freeze({
+    'image/png': 'png',
+    'image/jpeg': 'jpg',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'image/avif': 'avif',
+    'image/svg+xml': 'svg',
+});
+
+function outputExtension(mime) {
+    const extension = MIME_EXTENSIONS[mime];
+    if (!extension) throw new PluginError(`Unsupported output MIME type: ${mime}`, { status: 500, code: 'invalid_upstream_response' });
+    return extension;
+}
+
+function publicOutputParams(request) {
+    const { prompt: _prompt, ...params } = request;
+    return params;
+}
+
+async function atomicCreate(file, data) {
+    const temp = `${file}.${process.pid}-${randomUUID()}.tmp`;
+    try {
+        await writeFile(temp, data, { flag: 'wx' });
+        try {
+            // A hard-link publish is atomic and never overwrites an entry won by
+            // another process. The temp file is then removed in either case.
+            await link(temp, file);
+        } catch (error) {
+            if (error?.code !== 'EEXIST') throw error;
+        }
+    } finally {
+        await rm(temp, { force: true }).catch(() => {});
+    }
+}
+
+/**
+ * Durable, authoritative generated outputs. Entries deliberately have no TTL:
+ * browser caches and the internal DiskCache may be cleared without discarding
+ * the canonical server bytes for a normalized generation key.
+ */
+export class OutputStore {
+    constructor({ directory, enabled = true, includePrompt = false } = {}) {
+        if (!directory) throw new PluginError('outputs.directory is required', { status: 500, code: 'config_error' });
+        this.directory = directory;
+        this.enabled = Boolean(enabled);
+        this.includePrompt = Boolean(includePrompt);
+    }
+
+    async init() {
+        if (this.enabled) await mkdir(this.directory, { recursive: true });
+    }
+
+    metadataPath(key) {
+        if (!/^[a-f0-9]{64}$/.test(String(key))) throw new PluginError('Invalid output key', { status: 400, code: 'invalid_request' });
+        return path.join(this.directory, `${key}.json`);
+    }
+
+    imagePath(key, mime) {
+        if (!/^[a-f0-9]{64}$/.test(String(key))) throw new PluginError('Invalid output key', { status: 400, code: 'invalid_request' });
+        return path.join(this.directory, `${key}.${outputExtension(mime)}`);
+    }
+
+    async get(key) {
+        if (!this.enabled) return null;
+        this.metadataPath(key);
+        try {
+            const metadata = JSON.parse(await readFile(this.metadataPath(key), 'utf8'));
+            if (metadata.key !== key || typeof metadata.mime !== 'string') return null;
+            const image = this.imagePath(key, metadata.mime);
+            const data = await readFile(image);
+            const mime = sniffMime(data, metadata.mime);
+            const etag = createHash('sha256').update(data).digest('hex');
+            if (metadata.etag && metadata.etag !== etag) return null;
+            return { data, mime, etag, createdAt: metadata.createdAt, cached: true, durable: true, metadata };
+        } catch (error) {
+            if (error?.code === 'ENOENT' || error instanceof SyntaxError) return null;
+            throw error;
+        }
+    }
+
+    async set(key, result, { request, profileFingerprint } = {}) {
+        const data = Buffer.from(result.data);
+        const mime = sniffMime(data, result.mime);
+        const etag = createHash('sha256').update(data).digest('hex');
+        if (!this.enabled) return { data, mime, etag, createdAt: Date.now(), cached: false, durable: false };
+        await this.init();
+
+        const existing = await this.get(key);
+        if (existing) return existing;
+
+        const lockPath = path.join(this.directory, `${key}.lock`);
+        const image = this.imagePath(key, mime);
+        let lock;
+        try {
+            lock = await open(lockPath, 'wx');
+        } catch (error) {
+            if (error?.code !== 'EEXIST') throw error;
+            // A second process owns generation/persistence for the same key.
+            // Wait briefly for its authoritative metadata to become visible.
+            for (let attempt = 0; attempt < 200; attempt++) {
+                const raced = await this.get(key);
+                if (raced) return raced;
+                await new Promise(resolve => setTimeout(resolve, 25));
+            }
+            throw new PluginError('Timed out waiting for generated output persistence', { status: 503, code: 'output_busy' });
+        }
+
+        try {
+            const afterLock = await this.get(key);
+            if (afterLock) return afterLock;
+            const createdAt = new Date().toISOString();
+            const metadata = {
+                key,
+                createdAt,
+                mime,
+                etag,
+                profile: request?.profile ?? null,
+                seed: request?.seed ?? null,
+                profileFingerprint: profileFingerprint ?? null,
+                params: publicOutputParams(request ?? {}),
+                promptHash: fingerprint(String(request?.prompt ?? '')),
+                ...(this.includePrompt ? { prompt: String(request?.prompt ?? '') } : {}),
+            };
+            await atomicCreate(image, data);
+            await atomicCreate(this.metadataPath(key), `${JSON.stringify(metadata, null, 2)}\n`);
+        } finally {
+            await lock.close().catch(() => {});
+            await rm(lockPath, { force: true }).catch(() => {});
+        }
+
+        const stored = await this.get(key);
+        if (!stored) {
+            await Promise.allSettled([rm(image, { force: true }), rm(this.metadataPath(key), { force: true })]);
+            throw new PluginError('Could not persist generated output', { status: 500, code: 'output_error' });
+        }
+        return { ...stored, cached: false };
+    }
+
+    async delete(key) {
+        if (!this.enabled) return { removed: 0 };
+        this.metadataPath(key);
+        let metadata;
+        try { metadata = JSON.parse(await readFile(this.metadataPath(key), 'utf8')); } catch { metadata = null; }
+        const files = [this.metadataPath(key)];
+        if (metadata?.mime) {
+            try { files.push(this.imagePath(key, metadata.mime)); } catch { /* Invalid metadata cannot select an arbitrary path. */ }
+        } else {
+            for (const extension of Object.values(MIME_EXTENSIONS)) files.push(path.join(this.directory, `${key}.${extension}`));
+        }
+        const existed = await Promise.all(files.map(async file => {
+            try { await stat(file); return true; } catch { return false; }
+        }));
+        await Promise.allSettled(files.map(file => rm(file, { force: true })));
+        return { removed: existed.filter(Boolean).length };
+    }
+
+    async clear() {
+        if (!this.enabled) return { removed: 0 };
+        await this.init();
+        const names = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.(?:json|png|jpg|webp|gif|avif|svg)$/.test(name));
+        await Promise.all(names.map(name => rm(path.join(this.directory, name), { force: true })));
+        return { removed: names.length };
+    }
+
+    async stats() {
+        if (!this.enabled) return { enabled: false, entries: 0, bytes: 0, directory: this.directory };
+        await this.init();
+        const names = await readdir(this.directory);
+        const images = names.filter(name => /^[a-f0-9]{64}\.(?:png|jpg|webp|gif|avif|svg)$/.test(name));
+        let bytes = 0;
+        for (const name of images) bytes += (await stat(path.join(this.directory, name))).size;
+        return { enabled: true, entries: images.length, bytes, directory: this.directory, includePrompt: this.includePrompt };
+    }
+}
+
 export class ImageService {
-    constructor(config, { cache, fetchImpl = fetch, diagnostics = null, scope = 'anonymous' } = {}) {
+    constructor(config, { cache, outputs = null, fetchImpl = fetch, diagnostics = null, scope = 'anonymous' } = {}) {
         this.config = validateConfig(config);
         this.cache = cache;
+        this.outputs = outputs;
         this.fetchImpl = fetchImpl;
         this.diagnostics = diagnostics;
         this.scope = scope;
@@ -725,8 +908,8 @@ export class ImageService {
             }
         }
         const profileFingerprint = fingerprint(cacheProfile);
-        const key = fingerprint({ version: 2, request: normalized.request, profileFingerprint });
-        return { ...normalized, key };
+        const key = fingerprint({ version: 3, request: normalized.request, profileFingerprint });
+        return { ...normalized, key, profileFingerprint };
     }
 
     async generate(input, { bypassCache = false, signal, action = 'generate' } = {}) {
@@ -740,12 +923,29 @@ export class ImageService {
         }
         const detail = { action, profile: prepared.request.profile };
         try {
+            // Durable outputs are authoritative and are consulted even when the
+            // internal cache is bypassed (for example after a browser _refresh).
+            const durable = await this.outputs?.get(prepared.key);
+            if (durable) {
+                this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: durable.data.length });
+                this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: durable.data.length, durationMs: Date.now() - startedAt });
+                return { ...durable, key: prepared.key, request: prepared.request };
+            }
             if (!bypassCache) {
                 const hit = await this.cache?.get(prepared.key);
                 if (hit) {
-                    this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: hit.data.length });
-                    this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: hit.data.length, durationMs: Date.now() - startedAt });
-                    return { ...hit, key: prepared.key, request: prepared.request };
+                    // Seamlessly promote legacy DiskCache entries into durable
+                    // outputs, so existing images survive new devices without
+                    // forcing one more provider generation.
+                    const promoted = this.outputs
+                        ? await this.outputs.set(prepared.key, hit, {
+                            request: prepared.request,
+                            profileFingerprint: prepared.profileFingerprint,
+                        })
+                        : hit;
+                    this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: promoted.data.length });
+                    this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: promoted.data.length, durationMs: Date.now() - startedAt });
+                    return { ...promoted, key: prepared.key, request: prepared.request };
                 }
                 this.#record({ event: 'cache.lookup', ...detail, cache: 'miss' });
             } else {
@@ -787,8 +987,16 @@ export class ImageService {
             case 'comfyui': result = await comfyUiAdapter(prepared.profile, prepared.request, options); break;
             default: throw new PluginError('Unsupported profile type', { status: 500, code: 'config_error' });
         }
-        const entry = this.cache ? await this.cache.set(prepared.key, result) : { ...result, etag: createHash('sha256').update(result.data).digest('hex'), cached: false };
-        return { ...entry, key: prepared.key, request: prepared.request };
+        const durable = this.outputs
+            ? await this.outputs.set(prepared.key, result, {
+                request: prepared.request,
+                profileFingerprint: prepared.profileFingerprint,
+            })
+            : { ...result, etag: createHash('sha256').update(result.data).digest('hex'), cached: false };
+        // Internal cache is only an accelerator. Failure to populate it must not
+        // invalidate a successfully persisted authoritative output.
+        if (this.cache) await this.cache.set(prepared.key, durable).catch(() => {});
+        return { ...durable, key: prepared.key, request: prepared.request };
     }
 
     #record(event) {

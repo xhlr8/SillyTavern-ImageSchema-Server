@@ -265,9 +265,22 @@ Generic profiles support only `GET` and `POST`. Without `responseImagePath`, the
 
 Template placeholders currently available are the normalized request fields: `profile`, `prompt`, `width`, `height`, `seed`, `negative`, `model`, `quality`, `outputFormat`, `background`, `enhance`, `aspectRatio`, `imageSize`, `temperature`, and `personGeneration`. Templates are simple replacement, not an expression language.
 
-## Caching and seed semantics
+## Durable outputs, caching, and seed semantics
 
-The cache key is a SHA-256 fingerprint of:
+Successful generations are written to a durable `outputs` store before being returned. The internal cache is only an accelerator. A fresh browser, phone, or plugin process using the same authenticated SillyTavern user and normalized request receives the authoritative output bytes without rerunning the provider.
+
+Default layout:
+
+```text
+plugins/image-schema/outputs/<hashed-user-scope>/<request-key>.png
+plugins/image-schema/outputs/<hashed-user-scope>/<request-key>.json
+```
+
+Metadata includes MIME, ETag, profile, seed, sanitized effective parameters, profile fingerprint, and a prompt hash. Raw prompts are omitted unless `outputs.includePrompt: true`. Existing legacy DiskCache entries are promoted into outputs on their first cache hit.
+
+`GET`/`POST /outputs/stats` reports the current user's outputs. `POST /outputs/clear` explicitly removes durable outputs; `/cache/clear` leaves them intact.
+
+The request/output key is a SHA-256 fingerprint of:
 
 - cache-key format version;
 - the complete normalized request; and
@@ -285,7 +298,7 @@ Important operational details:
 
 - `/cache/clear` without a request removes matching `.bin` and `.json` files and reports the number of **files**, not logical image entries. With a canonical request body, it deletes that request's two cache paths.
 - `/cache/stats` counts `.bin` entries and bytes; it does not proactively delete all expired/corrupt orphan files.
-- `/cache/regenerate` deletes one canonical key and regenerates while bypassing cache reads.
+- `/cache/regenerate` deletes the internal cache key but intentionally reuses an existing authoritative durable output. Explicit output replacement requires clearing the corresponding output or creating a request with a new seed.
 - `/test` bypasses cache reads but successful test output is currently written to cache.
 - The extension UI currently exposes bulk clear only; request-specific deletion/regeneration routes are plugin API capabilities.
 - Browser-cached immutable bytes may remain visible after the disk entry is cleared.
