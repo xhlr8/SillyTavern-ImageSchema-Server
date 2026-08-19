@@ -142,11 +142,14 @@ test('Comfy adapter enforces output node selection and image response limits', a
     }), error => error.code === 'response_too_large');
 });
 
-test('provider config returns editable Comfy workflow and analyze route fetches only object_info', async t => {
+test('provider routes return and save Comfy instruction prompts while analyze fetches only object_info', async t => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'comfy-routes-'));
     const configPath = path.join(directory, 'config.yaml');
     const managedPath = path.join(directory, 'managed.json');
-    const profile = { type: 'comfyui', url: 'http://comfy.test', workflow: fixture, bindings };
+    const profile = {
+        type: 'comfyui', url: 'http://comfy.test', workflow: fixture, bindings,
+        instructionPrompt: 'Base Image Schema instructions may mention token fields without becoming secret.',
+    };
     await writeFile(configPath, `defaultProfile: c\nprofiles:\n  c: ${JSON.stringify(profile)}\n`);
     const oldConfig = process.env.SILLYTAVERN_IMAGE_CONFIG;
     const oldManaged = process.env.SILLYTAVERN_IMAGE_MANAGED_CONFIG;
@@ -171,6 +174,31 @@ test('provider config returns editable Comfy workflow and analyze route fetches 
     router.route('GET', '/providers/config').handlers.at(-1)({ method: 'GET', user: { profile: { admin: true } } }, configResponse);
     assert.deepEqual(configResponse.body.profiles[0].workflow, fixture);
     assert.deepEqual(configResponse.body.profiles[0].bindings, bindings);
+    assert.equal(configResponse.body.profiles[0].instructionPrompt, profile.instructionPrompt);
+
+    const savedInstructionPrompt = 'Managed per-profile Image Schema instructions.';
+    const saveRoute = router.route('POST', '/providers/profile/save');
+    const saveResponse = responseCapture();
+    await saveRoute.handlers.at(-1)({
+        method: 'POST', user: { profile: { admin: true } },
+        body: { profile: { name: 'c', ...profile, instructionPrompt: savedInstructionPrompt } },
+    }, saveResponse, error => { throw error; });
+    assert.deepEqual(saveResponse.body, { ok: true, name: 'c' });
+    const openAiInstructionPrompt = 'OpenAI profile schema instructions.';
+    const openAiSaveResponse = responseCapture();
+    await saveRoute.handlers.at(-1)({
+        method: 'POST', user: { profile: { admin: true } },
+        body: { profile: { name: 'o', type: 'openai', url: 'https://openai.example.test/images', instructionPrompt: openAiInstructionPrompt } },
+    }, openAiSaveResponse, error => { throw error; });
+    assert.deepEqual(openAiSaveResponse.body, { ok: true, name: 'o' });
+    const persisted = JSON.parse(await readFile(managedPath, 'utf8'));
+    assert.equal(persisted.profiles.c.profile.instructionPrompt, savedInstructionPrompt);
+    assert.equal(persisted.profiles.o.profile.instructionPrompt, openAiInstructionPrompt);
+
+    const updatedConfigResponse = responseCapture();
+    router.route('GET', '/providers/config').handlers.at(-1)({ method: 'GET', user: { profile: { admin: true } } }, updatedConfigResponse);
+    assert.equal(updatedConfigResponse.body.profiles.find(item => item.name === 'c').instructionPrompt, savedInstructionPrompt);
+    assert.equal(updatedConfigResponse.body.profiles.find(item => item.name === 'o').instructionPrompt, openAiInstructionPrompt);
 
     const route = router.route('POST', '/providers/comfy/analyze');
     const response = responseCapture();

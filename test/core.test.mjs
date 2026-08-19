@@ -15,6 +15,7 @@ import {
     normalizeRequest,
     openAiAdapter,
     sniffMime,
+    validateConfig,
 } from '../core.mjs';
 
 const PNG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
@@ -35,6 +36,28 @@ test('request normalization has seed but rejects a separate id concept', () => {
     const config = { defaultProfile: 'p', profiles: { p: { type: 'generic', url: 'https://example.test', defaults: {} } } };
     assert.equal(normalizeRequest({ prompt: 'cat', seed: '0' }, config).request.seed, 0);
     assert.throws(() => normalizeRequest({ prompt: 'cat', id: 'abc' }, config), /id parameter is not supported/);
+});
+
+test('base config validates instructionPrompt without applying it to generation or cache identity', async () => {
+    const base = { type: 'generic', method: 'POST', url: 'https://example.test', body: { prompt: '{prompt}' }, defaults: {} };
+    assert.equal(validateConfig({ defaultProfile: 'p', profiles: { p: { ...base, instructionPrompt: '' } } }).profiles.p.instructionPrompt, '');
+    assert.throws(
+        () => validateConfig({ defaultProfile: 'p', profiles: { p: { ...base, instructionPrompt: 'x'.repeat(20_001) } } }),
+        /instructionPrompt must be a string no longer than 20000 characters/,
+    );
+
+    let captured;
+    const serviceWithInstructions = new ImageService({ defaultProfile: 'p', profiles: { p: { ...base, instructionPrompt: 'Editor-only schema instructions' } } }, {
+        cache: null,
+        fetchImpl: async (_url, options) => {
+            captured = JSON.parse(options.body);
+            return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } });
+        },
+    });
+    const serviceWithoutInstructions = new ImageService({ defaultProfile: 'p', profiles: { p: base } }, { cache: null });
+    assert.equal(serviceWithInstructions.prepare({ prompt: 'cat' }).key, serviceWithoutInstructions.prepare({ prompt: 'cat' }).key);
+    await serviceWithInstructions.generate({ prompt: 'cat' }, { bypassCache: true });
+    assert.deepEqual(captured, { prompt: 'cat' });
 });
 
 test('empty allowedModels disables model overrides without rejecting the configured model', () => {

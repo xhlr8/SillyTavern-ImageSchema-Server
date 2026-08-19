@@ -5,6 +5,8 @@ import path from 'node:path';
 import { recordDiagnostic } from './diagnostics.mjs';
 import { applyComfyBindings, validateComfyBindings, validateComfyWorkflow } from './comfyui.mjs';
 
+export const INSTRUCTION_PROMPT_MAX_LENGTH = 20_000;
+
 export class PluginError extends Error {
     constructor(message, { status = 502, code = 'upstream_error', cause } = {}) {
         super(message, { cause });
@@ -590,6 +592,9 @@ export function validateConfig(config) {
     for (const [name, profile] of Object.entries(config.profiles)) {
         if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new PluginError(`Invalid profile name: ${name}`, { status: 500, code: 'config_error' });
         if (!['openai', 'gemini-sse', 'generic', 'comfyui'].includes(profile.type)) throw new PluginError(`Invalid type for profile ${name}`, { status: 500, code: 'config_error' });
+        if (profile.instructionPrompt !== undefined && (typeof profile.instructionPrompt !== 'string' || profile.instructionPrompt.length > INSTRUCTION_PROMPT_MAX_LENGTH)) {
+            throw new PluginError(`Profile ${name} instructionPrompt must be a string no longer than ${INSTRUCTION_PROMPT_MAX_LENGTH} characters`, { status: 500, code: 'config_error' });
+        }
         try {
             const url = new URL(profile.url);
             if (!['http:', 'https:'].includes(url.protocol)) throw new Error('unsupported protocol');
@@ -711,6 +716,9 @@ export class ImageService {
         const normalized = normalizeRequest(input, this.config);
         const cacheProfile = structuredClone(normalized.profile);
         delete cacheProfile.apiKey;
+        // Editor-only instructions are returned to clients but never affect
+        // generation requests or their cache identity.
+        delete cacheProfile.instructionPrompt;
         if (cacheProfile.headers && typeof cacheProfile.headers === 'object') {
             for (const key of Object.keys(cacheProfile.headers)) {
                 if (/authorization|api[-_]?key|token|secret/i.test(key)) delete cacheProfile.headers[key];

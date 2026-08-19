@@ -150,12 +150,12 @@ function requireExplicitAdmin(request, _response, next) {
 
 function contractProfile(input) {
     const source = exactObject(input, 'profile');
-    const common = ['name', 'type', 'url', 'model', 'allowedModels', 'timeoutMs', 'defaults'];
+    const common = ['name', 'type', 'url', 'model', 'allowedModels', 'timeoutMs', 'defaults', 'instructionPrompt'];
     const byType = {
         openai: [...common, 'body'],
         'gemini-sse': [...common, 'queryApiKey', 'systemInstruction', 'generationConfig', 'imageConfig'],
         generic: [...common, 'method', 'query', 'body', 'responseImagePath', 'responseMimePath', 'responseEncoding'],
-        comfyui: ['name', 'type', 'url', 'workflow', 'bindings', 'outputNode', 'pollIntervalMs', 'timeoutMs'],
+        comfyui: ['name', 'type', 'url', 'workflow', 'bindings', 'outputNode', 'pollIntervalMs', 'timeoutMs', 'instructionPrompt'],
     };
     const allowed = new Set(byType[source.type] ?? common);
     for (const key of Object.keys(source)) if (!allowed.has(key)) throw new PluginError(`profile contains unsupported field: ${key}`, { status: 400, code: 'invalid_config' });
@@ -235,6 +235,7 @@ function contractConfigView(view) {
             allowedModels: profile.allowedModels ?? [],
             timeoutMs: profile.timeoutMs ?? 120000,
             defaults: profile.defaults ?? {},
+            instructionPrompt: profile.instructionPrompt ?? '',
             apiKeyConfigured: profile.hasSecret === true,
         })),
     };

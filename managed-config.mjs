@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 
-import { PluginError, profilePublicView, validateConfig } from './core.mjs';
+import { INSTRUCTION_PROMPT_MAX_LENGTH, PluginError, profilePublicView, validateConfig } from './core.mjs';
 import { validateComfyBindings, validateComfyWorkflow } from './comfyui.mjs';
 
 const PROFILE_NAME = /^[A-Za-z0-9_-]+$/;
@@ -10,12 +10,12 @@ const HTTP_HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const SENSITIVE_KEY = /api[-_]?key|authorization|token|secret|password|credential/i;
 const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 const UNSAFE_SECRET_HEADERS = new Set(['host', 'content-length', 'connection', 'transfer-encoding', 'cookie', 'set-cookie', 'proxy-authorization', 'proxy-authenticate']);
-const COMMON_FIELDS = new Set(['type', 'url', 'model', 'allowedModels', 'timeoutMs', 'defaults', 'headers']);
+const COMMON_FIELDS = new Set(['type', 'url', 'model', 'allowedModels', 'timeoutMs', 'defaults', 'headers', 'instructionPrompt']);
 const TYPE_FIELDS = {
     openai: new Set([...COMMON_FIELDS, 'body']),
     'gemini-sse': new Set([...COMMON_FIELDS, 'queryApiKey', 'systemInstruction', 'generationConfig', 'imageConfig']),
     generic: new Set([...COMMON_FIELDS, 'method', 'query', 'body', 'responseImagePath', 'responseMimePath', 'responseEncoding']),
-    comfyui: new Set(['type', 'url', 'workflow', 'bindings', 'outputNode', 'pollIntervalMs', 'timeoutMs', 'defaults']),
+    comfyui: new Set(['type', 'url', 'workflow', 'bindings', 'outputNode', 'pollIntervalMs', 'timeoutMs', 'defaults', 'instructionPrompt']),
 };
 const DEFAULT_FIELDS = new Set(['width', 'height', 'negative', 'model', 'quality', 'outputFormat', 'background', 'enhance', 'aspectRatio', 'imageSize', 'temperature', 'personGeneration']);
 
@@ -96,6 +96,7 @@ export function validateManagedProfile(input, name = 'profile') {
     const result = { type, url: validateUrl(input.url, `${name}.url`) };
     if (input.headers !== undefined) result.headers = safeJson(input.headers, `${name}.headers`);
     if (input.model !== undefined) result.model = optionalString(input.model, `${name}.model`, { max: 500 });
+    if (input.instructionPrompt !== undefined) result.instructionPrompt = optionalString(input.instructionPrompt, `${name}.instructionPrompt`, { max: INSTRUCTION_PROMPT_MAX_LENGTH });
     if (input.allowedModels !== undefined) {
         if (!Array.isArray(input.allowedModels) || input.allowedModels.length > 100 || input.allowedModels.some(item => typeof item !== 'string' || !item || item.length > 500)) {
             throw invalid(`${name}.allowedModels must be an array of non-empty strings`);

@@ -21,6 +21,7 @@ const baseConfig = () => ({
             url: 'https://base.example.test/images',
             apiKey: 'base-secret',
             model: 'base-model',
+            instructionPrompt: 'Use the saved schema instructions for this profile.',
             defaults: { width: 1024, height: 1024 },
         },
         other: { type: 'generic', method: 'GET', url: 'https://other.example.test/{prompt}', defaults: {} },
@@ -45,17 +46,40 @@ test('managed profile schemas reject extra, sensitive, and unsafe method fields'
     assert.throws(() => validateSecret('generic', { headerName: 'Host', value: 'evil' }), /not allowed/);
 });
 
-test('store persists atomically, protects the file, and never exposes secret values', async t => {
+test('instructionPrompt is accepted for every managed profile type with a strict length limit', () => {
+    const prompt = 'Describe the image using the profile schema.';
+    const profiles = [
+        { type: 'openai', url: 'https://openai.example.test/images' },
+        { type: 'gemini-sse', url: 'https://gemini.example.test/generate' },
+        { type: 'generic', url: 'https://generic.example.test/image' },
+        {
+            type: 'comfyui', url: 'https://comfy.example.test',
+            workflow: { 1: { class_type: 'Prompt', inputs: { text: '' } } },
+            bindings: { prompt: { node: '1', input: 'text' } },
+        },
+    ];
+    for (const profile of profiles) {
+        assert.equal(validateManagedProfile({ ...profile, instructionPrompt: prompt }).instructionPrompt, prompt);
+        assert.throws(() => validateManagedProfile({ ...profile, instructionPrompt: 42 }), /instructionPrompt must be a string/);
+        assert.throws(() => validateManagedProfile({ ...profile, instructionPrompt: 'x'.repeat(20_001) }), /instructionPrompt must be a string/);
+    }
+});
+
+test('store persists atomically, protects the file, exposes instructions, and never exposes secret values', async t => {
     const { store, filePath, directory } = await fixture(t);
     const secret = 'managed-super-secret';
-    await store.create('managed', { type: 'openai', url: 'https://managed.example.test/images', model: 'm' });
+    const instructionPrompt = 'Return a concise Image Schema object.';
+    await store.create('managed', { type: 'openai', url: 'https://managed.example.test/images', model: 'm', instructionPrompt });
     const view = await store.replaceSecret('managed', { apiKey: secret });
 
     assert.equal(view.profiles.managed.hasSecret, true);
+    assert.equal(view.profiles.managed.instructionPrompt, instructionPrompt);
+    assert.equal(view.profiles.base.instructionPrompt, 'Use the saved schema instructions for this profile.');
     assert.equal(JSON.stringify(view).includes(secret), false);
     assert.equal(JSON.stringify(view).includes('apiKey'), false);
     const persisted = await readFile(filePath, 'utf8');
     assert.equal(persisted.includes(secret), true);
+    assert.equal(JSON.parse(persisted).profiles.managed.profile.instructionPrompt, instructionPrompt);
     assert.deepEqual(await readdir(directory), ['managed-config.json']);
     if (process.platform !== 'win32') assert.equal((await stat(filePath)).mode & 0o777, 0o600);
 });
