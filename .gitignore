@@ -1,7 +1,6 @@
-# Plugin-managed provider profiles and credentials
-/managed-config.json
-/managed-config.json.*.tmp
-
-# Local base configuration and generated cache
-/config.yaml
-/cache/
+node_modules/
+config.yaml
+managed-config.json
+managed-config.json.*.tmp
+cache/
+outputs/
