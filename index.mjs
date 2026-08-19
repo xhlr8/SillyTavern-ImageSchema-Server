@@ -107,21 +107,8 @@ function builtInErrorImage(error) {
     return { data, mime: 'image/svg+xml', etag: createHash('sha256').update(data).digest('hex'), cached: false, error: true };
 }
 
-async function errorImage(config, error) {
-    const category = error.code === 'rate_limit' ? 'rateLimit'
-        : error.code === 'safety' || error.status === 400 ? 'safety'
-            : error.code === 'timeout' ? 'timeout'
-                : error.code === 'upstream_error' || error.code === 'connection_error' ? 'upstream'
-                    : 'unknown';
-    const configured = config.errorImages?.[category] ?? config.errorImages?.unknown;
-    if (!configured) return builtInErrorImage(error);
-    const file = path.isAbsolute(configured) ? configured : path.resolve(pluginDirectory, configured);
-    try {
-        const data = await readFile(file);
-        return { data, mime: sniffMime(data), etag: createHash('sha256').update(data).digest('hex'), cached: false, error: true };
-    } catch {
-        return builtInErrorImage(error);
-    }
+function errorImage(_config, error) {
+    return builtInErrorImage(error);
 }
 
 function exactBody(request, allowed) {

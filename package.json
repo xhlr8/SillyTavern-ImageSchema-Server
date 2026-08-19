@@ -1,7 +1,7 @@
 {
-  "name": "sillytavern-image-server-plugin",
-  "version": "1.0.0",
-  "description": "Configured, cached image generation routes for SillyTavern",
+  "name": "sillytavern-image-schema-server",
+  "version": "1.1.0",
+  "description": "Provider execution and durable outputs for SillyTavern Image Schema",
   "type": "module",
   "main": "index.mjs",
   "exports": "./index.mjs",
