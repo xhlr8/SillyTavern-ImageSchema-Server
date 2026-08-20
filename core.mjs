@@ -607,6 +607,14 @@ export function validateConfig(config) {
         if (config.outputs.directory !== undefined && (typeof config.outputs.directory !== 'string' || !config.outputs.directory.trim())) throw new PluginError('outputs.directory must be a non-empty string', { status: 500, code: 'config_error' });
         if (config.outputs.enabled !== undefined && typeof config.outputs.enabled !== 'boolean') throw new PluginError('outputs.enabled must be boolean', { status: 500, code: 'config_error' });
         if (config.outputs.includePrompt !== undefined && typeof config.outputs.includePrompt !== 'boolean') throw new PluginError('outputs.includePrompt must be boolean', { status: 500, code: 'config_error' });
+        if (config.outputs.profileAliases !== undefined) {
+            if (!config.outputs.profileAliases || typeof config.outputs.profileAliases !== 'object' || Array.isArray(config.outputs.profileAliases)) throw new PluginError('outputs.profileAliases must be an object', { status: 500, code: 'config_error' });
+            for (const [profile, aliases] of Object.entries(config.outputs.profileAliases)) {
+                if (!/^[A-Za-z0-9_-]+$/.test(profile) || !Array.isArray(aliases) || aliases.some(alias => typeof alias !== 'string' || !/^[A-Za-z0-9_-]+$/.test(alias))) {
+                    throw new PluginError('outputs.profileAliases must map profile names to profile-name arrays', { status: 500, code: 'config_error' });
+                }
+            }
+        }
     }
     if (!config.profiles || typeof config.profiles !== 'object' || !Object.keys(config.profiles).length) throw new PluginError('At least one profile is required', { status: 500, code: 'config_error' });
     if (!config.defaultProfile) config.defaultProfile = Object.keys(config.profiles)[0];
@@ -801,6 +809,30 @@ export class OutputStore {
         }
     }
 
+    async findCompatible(request, profileAliases = {}) {
+        if (!this.enabled || request?.seed === null || request?.seed === undefined) return null;
+        await this.init();
+        const currentProfile = String(request.profile ?? '');
+        const acceptedProfiles = new Set([currentProfile, ...(profileAliases[currentProfile] ?? [])]);
+        const expectedPromptHash = fingerprint(String(request.prompt ?? ''));
+        const expectedParams = publicOutputParams(request);
+        delete expectedParams.profile;
+        const expectedCanonical = canonicalize(expectedParams);
+        const metadataFiles = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        for (const name of metadataFiles) {
+            let metadata;
+            try { metadata = JSON.parse(await readFile(path.join(this.directory, name), 'utf8')); } catch { continue; }
+            const storedProfile = String(metadata.effectiveProfile ?? metadata.profile ?? metadata.params?.profile ?? '');
+            if (!acceptedProfiles.has(storedProfile) || metadata.promptHash !== expectedPromptHash || metadata.seed !== request.seed) continue;
+            const storedParams = { ...(metadata.params ?? {}) };
+            delete storedParams.profile;
+            if (canonicalize(storedParams) !== expectedCanonical) continue;
+            const compatible = await this.get(metadata.key);
+            if (compatible) return compatible;
+        }
+        return null;
+    }
+
     async set(key, result, { request, profileFingerprint, requestedProfile, effectiveProfile, fallbackReason = null } = {}) {
         const data = Buffer.from(result.data);
         const mime = sniffMime(data, result.mime);
@@ -973,6 +1005,26 @@ export class ImageService {
                     requestedProfile: durable.metadata?.requestedProfile ?? prepared.request.profile,
                     effectiveProfile: durable.metadata?.effectiveProfile ?? durable.metadata?.profile ?? prepared.request.profile,
                     fallbackReason: durable.metadata?.fallbackReason ?? null,
+                };
+            }
+            const compatible = await this.outputs?.findCompatible(prepared.request, this.config.outputs?.profileAliases);
+            if (compatible) {
+                const promoted = await this.outputs.set(prepared.key, compatible, {
+                    request: prepared.request,
+                    profileFingerprint: prepared.profileFingerprint,
+                    requestedProfile: prepared.request.profile,
+                    effectiveProfile: prepared.request.profile,
+                });
+                this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: promoted.data.length, source: 'compatible_output' });
+                this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: promoted.data.length, durationMs: Date.now() - startedAt });
+                return {
+                    ...promoted,
+                    cached: true,
+                    key: prepared.key,
+                    request: prepared.request,
+                    requestedProfile: promoted.metadata?.requestedProfile ?? prepared.request.profile,
+                    effectiveProfile: promoted.metadata?.effectiveProfile ?? prepared.request.profile,
+                    fallbackReason: promoted.metadata?.fallbackReason ?? null,
                 };
             }
             if (!bypassCache) {

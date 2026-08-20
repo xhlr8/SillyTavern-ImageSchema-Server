@@ -305,6 +305,40 @@ test('durable outputs are authoritative across service/cache instances and isola
     assert.equal(otherUserCalls, 1);
 });
 
+test('renamed profiles recover and promote matching seeded durable outputs', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-alias-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const outputs = new OutputStore({ directory: path.join(root, 'outputs') });
+    const oldConfig = {
+        defaultProfile: 'old',
+        outputs: { enabled: true },
+        profiles: { old: { type: 'generic', url: 'https://fixed.test/{prompt}', defaults: {} } },
+    };
+    const oldService = new ImageService(oldConfig, {
+        cache: null,
+        outputs,
+        fetchImpl: async () => new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } }),
+    });
+    const oldResult = await oldService.generate({ prompt: 'seeded cat', seed: 42 });
+
+    const renamedConfig = {
+        defaultProfile: 'renamed',
+        outputs: { enabled: true, profileAliases: { renamed: ['old'] } },
+        profiles: { renamed: { type: 'generic', url: 'https://fixed.test/{prompt}', defaults: {} } },
+    };
+    const renamedService = new ImageService(renamedConfig, {
+        cache: null,
+        outputs,
+        fetchImpl: async () => { throw new Error('compatible durable output should avoid generation'); },
+    });
+    const recovered = await renamedService.generate({ prompt: 'seeded cat', seed: 42 });
+    assert.notEqual(recovered.key, oldResult.key);
+    assert.equal(recovered.cached, true);
+    assert.equal(recovered.etag, oldResult.etag);
+    assert.deepEqual(recovered.data, PNG);
+    assert.equal((await outputs.stats()).entries, 2, 'matching output is promoted under the current request key');
+});
+
 test('OutputStore rejects keys that could escape its configured directory', async t => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'st-image-output-key-'));
     t.after(() => rm(directory, { recursive: true, force: true }));
