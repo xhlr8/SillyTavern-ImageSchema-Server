@@ -343,6 +343,53 @@ test('clearing internal cache leaves durable output reusable until explicitly cl
     assert.equal((await outputs.stats()).entries, 0);
 });
 
+test('fallback routing retries one eligible provider failure and shares one durable key', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-fallback-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const config = {
+        defaultProfile: 'primary',
+        routing: { enabled: true, fallbackProfile: 'fallback', fallbackOn: ['connection_error'] },
+        profiles: {
+            primary: { type: 'generic', method: 'GET', url: 'https://primary.test', defaults: {} },
+            fallback: { type: 'generic', method: 'GET', url: 'https://fallback.test', defaults: {} },
+        },
+    };
+    const calls = [];
+    const service = new ImageService(config, {
+        cache: new DiskCache({ directory: path.join(root, 'cache') }),
+        outputs: new OutputStore({ directory: path.join(root, 'outputs') }),
+        fetchImpl: async url => {
+            calls.push(String(url));
+            if (String(url).includes('primary.test')) throw new Error('offline');
+            return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } });
+        },
+    });
+    const result = await service.generate({ prompt: 'fallback cat' });
+    assert.equal(result.mime, 'image/png');
+    assert.deepEqual(calls, ['https://primary.test/', 'https://fallback.test/']);
+    const reused = await service.generate({ prompt: 'fallback cat' });
+    assert.equal(reused.key, result.key);
+    assert.equal(calls.length, 2);
+});
+
+test('fallback routing does not retry non-eligible safety failures', async () => {
+    const config = {
+        defaultProfile: 'primary',
+        routing: { enabled: true, fallbackProfile: 'fallback', fallbackOn: ['connection_error'] },
+        profiles: {
+            primary: { type: 'generic', method: 'GET', url: 'https://primary.test', defaults: {} },
+            fallback: { type: 'generic', method: 'GET', url: 'https://fallback.test', defaults: {} },
+        },
+    };
+    const calls = [];
+    const service = new ImageService(config, { cache: null, fetchImpl: async url => {
+        calls.push(String(url));
+        return new Response('blocked by safety', { status: 400 });
+    } });
+    await assert.rejects(service.generate({ prompt: 'blocked cat' }), error => error.code === 'safety');
+    assert.deepEqual(calls, ['https://primary.test/']);
+});
+
 test('MIME sniffing recognizes PNG and does not trust non-image hints', () => {
     assert.equal(sniffMime(PNG), 'image/png');
     assert.throws(() => sniffMime(Buffer.from('not an image'), 'text/plain'), /recognized image/);

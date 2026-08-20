@@ -18,6 +18,9 @@ const TYPE_FIELDS = {
     comfyui: new Set(['type', 'url', 'workflow', 'bindings', 'outputNode', 'pollIntervalMs', 'timeoutMs', 'defaults', 'instructionPrompt']),
 };
 const DEFAULT_FIELDS = new Set(['width', 'height', 'negative', 'model', 'quality', 'outputFormat', 'background', 'enhance', 'aspectRatio', 'imageSize', 'temperature', 'personGeneration']);
+export const DEFAULT_FALLBACK_ON = Object.freeze(['connection_error', 'timeout', 'rate_limit', 'upstream_error', 'invalid_upstream_response', 'response_too_large']);
+export const ALLOWED_FALLBACK_ON = Object.freeze([...DEFAULT_FALLBACK_ON, 'safety', 'invalid_request', 'config_error']);
+const FALLBACK_CODE_SET = new Set(ALLOWED_FALLBACK_ON);
 
 function invalid(message) {
     return new PluginError(message, { status: 400, code: 'invalid_config' });
@@ -155,6 +158,28 @@ export function validateProfileName(name) {
     return name;
 }
 
+export function validateRoutingSettings(input, label = 'routing') {
+    exactFields(input, new Set(['enabled', 'fallbackProfile', 'fallbackOn']), label);
+    if (typeof input.enabled !== 'boolean') throw invalid(`${label}.enabled must be boolean`);
+    let fallbackProfile = null;
+    if (input.fallbackProfile !== undefined && input.fallbackProfile !== null && input.fallbackProfile !== '') {
+        fallbackProfile = validateProfileName(input.fallbackProfile);
+    }
+    if (!Array.isArray(input.fallbackOn) || input.fallbackOn.length > ALLOWED_FALLBACK_ON.length) {
+        throw invalid(`${label}.fallbackOn must be an array of supported failure codes`);
+    }
+    const fallbackOn = [];
+    for (const code of input.fallbackOn) {
+        if (typeof code !== 'string' || !FALLBACK_CODE_SET.has(code)) throw invalid(`${label}.fallbackOn contains unsupported code: ${code}`);
+        if (!fallbackOn.includes(code)) fallbackOn.push(code);
+    }
+    return { enabled: input.enabled, fallbackProfile, fallbackOn };
+}
+
+function defaultRoutingSettings() {
+    return { enabled: false, fallbackProfile: null, fallbackOn: [...DEFAULT_FALLBACK_ON] };
+}
+
 export function validateSecret(type, input) {
     if (type === 'openai' || type === 'gemini-sse') {
         exactFields(input, new Set(['apiKey']), 'secret');
@@ -173,12 +198,13 @@ export function validateSecret(type, input) {
 }
 
 function blankDocument() {
-    return { version: 1, defaultProfile: null, profiles: {}, deletedProfiles: [] };
+    return { version: 1, defaultProfile: null, routing: defaultRoutingSettings(), profiles: {}, deletedProfiles: [] };
 }
 
 function validateDocument(value) {
-    exactFields(value, new Set(['version', 'defaultProfile', 'profiles', 'deletedProfiles']), 'managed config');
+    exactFields(value, new Set(['version', 'defaultProfile', 'routing', 'profiles', 'deletedProfiles']), 'managed config');
     if (value.version !== 1) throw invalid('managed config.version must be 1');
+    const routing = value.routing === undefined ? defaultRoutingSettings() : validateRoutingSettings(value.routing, 'managed config.routing');
     if (value.defaultProfile !== null) validateProfileName(value.defaultProfile);
     plainObject(value.profiles, 'managed config.profiles');
     const profiles = {};
@@ -200,7 +226,7 @@ function validateDocument(value) {
     for (const name of Object.keys(profiles)) {
         if (deletedProfiles.includes(name)) throw invalid(`managed profile ${name} is also deleted`);
     }
-    return { version: 1, defaultProfile: value.defaultProfile, profiles, deletedProfiles };
+    return { version: 1, defaultProfile: value.defaultProfile, routing, profiles, deletedProfiles };
 }
 
 function sensitiveHeaders(headers) {
@@ -233,7 +259,11 @@ export function mergeManagedConfig(baseConfig, document) {
     if (!Object.keys(profiles).length) throw invalid('At least one effective profile is required');
     const preferred = managed.defaultProfile ?? baseConfig.defaultProfile;
     const defaultProfile = profiles[preferred] ? preferred : Object.keys(profiles)[0];
-    return validateConfig({ ...structuredClone(baseConfig), defaultProfile, profiles });
+    const routing = {
+        ...managed.routing,
+        fallbackProfile: managed.routing.fallbackProfile && profiles[managed.routing.fallbackProfile] ? managed.routing.fallbackProfile : null,
+    };
+    return validateConfig({ ...structuredClone(baseConfig), defaultProfile, routing, profiles });
 }
 
 function stripSecrets(value, depth = 0, { hideAllHeaders = false } = {}) {
@@ -281,6 +311,7 @@ export function managedConfigPublicView(baseConfig, document, effectiveConfig = 
     }
     return {
         defaultProfile: effectiveConfig.defaultProfile,
+        routing: structuredClone(effectiveConfig.routing),
         profiles,
         deletedBaseProfiles: [...deleted].filter(name => Boolean(baseConfig.profiles[name])),
     };
@@ -401,6 +432,7 @@ export class ManagedProfileStore {
             next.deletedProfiles = next.deletedProfiles.filter(item => item !== name);
             if (this.baseConfig.profiles[previousName]) next.deletedProfiles.push(previousName);
             if (next.defaultProfile === previousName || (next.defaultProfile === null && this.baseConfig.defaultProfile === previousName)) next.defaultProfile = name;
+            if (next.routing.fallbackProfile === previousName) next.routing.fallbackProfile = name;
         });
     }
 
@@ -429,6 +461,10 @@ export class ManagedProfileStore {
             const remaining = Object.keys(this.config.profiles).filter(item => item !== name);
             if (!remaining.length) throw invalid('At least one effective profile is required');
             if (next.defaultProfile === name || (next.defaultProfile === null && this.baseConfig.defaultProfile === name)) next.defaultProfile = remaining[0];
+            if (next.routing.fallbackProfile === name) {
+                next.routing.fallbackProfile = null;
+                next.routing.enabled = false;
+            }
         });
     }
 
@@ -437,6 +473,17 @@ export class ManagedProfileStore {
         return this.mutate(next => {
             if (!this.config.profiles[name]) throw new PluginError(`Unknown profile: ${name}`, { status: 404, code: 'invalid_profile' });
             next.defaultProfile = name;
+        });
+    }
+
+    setRouting(settings) {
+        const clean = validateRoutingSettings(settings);
+        return this.mutate(next => {
+            if (clean.fallbackProfile && !this.config.profiles[clean.fallbackProfile]) {
+                throw new PluginError(`Unknown fallback profile: ${clean.fallbackProfile}`, { status: 400, code: 'invalid_config' });
+            }
+            if (clean.enabled && !clean.fallbackProfile) throw invalid('routing.fallbackProfile is required when routing is enabled');
+            next.routing = clean;
         });
     }
 

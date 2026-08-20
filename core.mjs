@@ -785,7 +785,7 @@ export class OutputStore {
         }
     }
 
-    async set(key, result, { request, profileFingerprint } = {}) {
+    async set(key, result, { request, profileFingerprint, requestedProfile, effectiveProfile, fallbackReason = null } = {}) {
         const data = Buffer.from(result.data);
         const mime = sniffMime(data, result.mime);
         const etag = createHash('sha256').update(data).digest('hex');
@@ -821,7 +821,10 @@ export class OutputStore {
                 createdAt,
                 mime,
                 etag,
-                profile: request?.profile ?? null,
+                profile: effectiveProfile ?? request?.profile ?? null,
+                requestedProfile: requestedProfile ?? request?.profile ?? null,
+                effectiveProfile: effectiveProfile ?? request?.profile ?? null,
+                fallbackReason,
                 seed: request?.seed ?? null,
                 profileFingerprint: profileFingerprint ?? null,
                 params: publicOutputParams(request ?? {}),
@@ -880,6 +883,30 @@ export class OutputStore {
     }
 }
 
+function cacheSafeProfile(profile) {
+    const safe = structuredClone(profile);
+    delete safe.apiKey;
+    // Editor-only instructions and credentials never affect generation identity.
+    delete safe.instructionPrompt;
+    if (safe.headers && typeof safe.headers === 'object') {
+        for (const key of Object.keys(safe.headers)) {
+            if (/authorization|api[-_]?key|token|secret/i.test(key)) delete safe.headers[key];
+        }
+    }
+    return safe;
+}
+
+function fallbackRouting(config, requestedProfile) {
+    const configured = config.routing ?? {};
+    const fallbackProfile = typeof configured.fallbackProfile === 'string' ? configured.fallbackProfile : null;
+    const fallbackOn = Array.isArray(configured.fallbackOn) ? [...configured.fallbackOn] : [];
+    const enabled = configured.enabled === true && Boolean(fallbackProfile) && fallbackProfile !== requestedProfile && Boolean(config.profiles?.[fallbackProfile]);
+    const profileFingerprint = fallbackProfile && config.profiles?.[fallbackProfile]
+        ? fingerprint(cacheSafeProfile(config.profiles[fallbackProfile]))
+        : null;
+    return { enabled, fallbackProfile, fallbackOn, profileFingerprint };
+}
+
 export class ImageService {
     constructor(config, { cache, outputs = null, fetchImpl = fetch, diagnostics = null, scope = 'anonymous' } = {}) {
         this.config = validateConfig(config);
@@ -897,19 +924,13 @@ export class ImageService {
 
     prepare(input) {
         const normalized = normalizeRequest(input, this.config);
-        const cacheProfile = structuredClone(normalized.profile);
-        delete cacheProfile.apiKey;
-        // Editor-only instructions are returned to clients but never affect
-        // generation requests or their cache identity.
-        delete cacheProfile.instructionPrompt;
-        if (cacheProfile.headers && typeof cacheProfile.headers === 'object') {
-            for (const key of Object.keys(cacheProfile.headers)) {
-                if (/authorization|api[-_]?key|token|secret/i.test(key)) delete cacheProfile.headers[key];
-            }
-        }
-        const profileFingerprint = fingerprint(cacheProfile);
-        const key = fingerprint({ version: 3, request: normalized.request, profileFingerprint });
-        return { ...normalized, key, profileFingerprint };
+        const profileFingerprint = fingerprint(cacheSafeProfile(normalized.profile));
+        const routing = fallbackRouting(this.config, normalized.request.profile);
+        // Identity includes the requested primary and the complete effective
+        // fallback policy/profile fingerprint. A fallback success therefore
+        // remains stable without colliding with primary-only output.
+        const key = fingerprint({ version: 4, request: normalized.request, profileFingerprint, routing });
+        return { ...normalized, key, profileFingerprint, routing };
     }
 
     async generate(input, { bypassCache = false, signal, action = 'generate' } = {}) {
@@ -959,7 +980,7 @@ export class ImageService {
             const maxConcurrent = Number(this.config.limits?.maxConcurrentRequests ?? 4);
             if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) throw new PluginError('limits.maxConcurrentRequests must be a positive integer', { status: 500, code: 'config_error' });
             if (this.inflight.size >= maxConcurrent) throw new PluginError('Too many image requests are already running', { status: 429, code: 'rate_limit' });
-            const operation = this.#generateOwned(prepared, signal).finally(() => this.inflight.delete(prepared.key));
+            const operation = this.#generateWithFallback(prepared, signal).finally(() => this.inflight.delete(prepared.key));
             this.inflight.set(prepared.key, operation);
             const result = await operation;
             this.#record({ event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'miss', status: 200, bytes: result.data.length, durationMs: Date.now() - startedAt });
@@ -967,6 +988,43 @@ export class ImageService {
         } catch (error) {
             this.#record({ level: 'error', event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'error', status: error?.status ?? 500, code: error?.code ?? 'internal_error', durationMs: Date.now() - startedAt });
             throw error;
+        }
+    }
+
+    async #generateWithFallback(prepared, signal) {
+        try {
+            return await this.#generateOwned(prepared, signal);
+        } catch (error) {
+            const code = String(error?.code ?? 'internal_error');
+            const routing = prepared.routing;
+            if (!routing?.enabled || !routing.fallbackOn.includes(code)) throw error;
+
+            const fallbackInput = {
+                ...prepared.request,
+                profile: routing.fallbackProfile,
+                // The primary profile's resolved model is not portable across
+                // providers. Let the fallback profile choose its own model.
+                model: undefined,
+            };
+            const normalized = normalizeRequest(fallbackInput, this.config);
+            const fallbackPrepared = {
+                ...normalized,
+                // One logical request has one durable output key regardless of
+                // whether primary or fallback produced it.
+                key: prepared.key,
+                profileFingerprint: routing.profileFingerprint,
+                routing: { enabled: false, fallbackProfile: null, fallbackOn: [] },
+                requestedProfile: prepared.request.profile,
+                fallbackReason: code,
+            };
+            this.#record({
+                event: 'provider.fallback',
+                action: `${prepared.request.profile}-to-${routing.fallbackProfile}`,
+                profile: routing.fallbackProfile,
+                status: error?.status ?? 502,
+                code,
+            });
+            return this.#generateOwned(fallbackPrepared, signal);
         }
     }
 

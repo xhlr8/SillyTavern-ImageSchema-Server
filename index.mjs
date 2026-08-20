@@ -200,6 +200,7 @@ async function limitedJson(response, maximum = 32 * 1024 * 1024) {
 function contractConfigView(view) {
     return {
         defaultProfile: view.defaultProfile,
+        routing: view.routing,
         profiles: Object.values(view.profiles).map(profile => ({
             name: profile.name,
             type: profile.type,
@@ -326,6 +327,12 @@ export async function init(router) {
         await store.setDefault(name);
         routeEvent(request, { event: 'provider.default', action: 'set', profile: name, status: 200 });
         return response.json({ ok: true, defaultProfile: name });
+    }));
+    router.post('/providers/routing', requireAdmin, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['enabled', 'fallbackProfile', 'fallbackOn']));
+        const view = await store.setRouting(body);
+        routeEvent(request, { event: 'provider.routing', action: body.enabled ? 'enable' : 'disable', profile: body.fallbackProfile || undefined, status: 200 });
+        return response.json({ ok: true, routing: view.routing });
     }));
     router.post('/providers/secret', requireAdmin, asyncRoute(async (request, response) => {
         const body = exactBody(request, new Set(['name', 'apiKey', 'clear']));
