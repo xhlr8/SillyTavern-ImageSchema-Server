@@ -52,16 +52,28 @@ export class ActivityDiagnostics {
         const action = safeLabel(input.action);
         const profile = safeLabel(input.profile);
         const code = safeLabel(input.code);
+        const requestId = safeLabel(input.requestId);
+        const stage = safeLabel(input.stage);
+        const outcome = safeLabel(input.outcome);
+        const source = safeLabel(input.source);
+        const mime = safeLabel(String(input.mime ?? '').replace('/', '_'));
         const durationMs = safeInteger(Math.round(Number(input.durationMs)), { maximum: 86_400_000 });
         const status = safeInteger(input.status, { minimum: 100, maximum: 599 });
         const bytes = safeInteger(input.bytes);
+        const count = safeInteger(input.count);
         if (action) entry.action = action;
         if (profile) entry.profile = profile;
         if (CACHE_RESULTS.has(input.cache)) entry.cache = input.cache;
         if (durationMs !== undefined) entry.durationMs = durationMs;
         if (status !== undefined) entry.status = status;
         if (code) entry.code = code;
+        if (requestId) entry.requestId = requestId;
+        if (stage) entry.stage = stage;
+        if (outcome) entry.outcome = outcome;
+        if (source) entry.source = source;
+        if (mime) entry.mime = mime;
         if (bytes !== undefined) entry.bytes = bytes;
+        if (count !== undefined) entry.count = count;
         entry.scope = safeLabel(input.scope) ?? 'anonymous';
         this.#append(entry);
         return publicEvent(entry);
@@ -137,5 +149,5 @@ export function recordDiagnostic(diagnostics, event) {
 export const diagnosticsContract = Object.freeze({
     defaultLimit: DEFAULT_LIMIT,
     maxLimit: MAX_LIMIT,
-    fields: Object.freeze(['timestamp', 'level', 'event', 'action', 'profile', 'cache', 'durationMs', 'status', 'code', 'bytes']),
+    fields: Object.freeze(['timestamp', 'level', 'event', 'action', 'profile', 'cache', 'durationMs', 'status', 'code', 'bytes', 'requestId', 'stage', 'outcome', 'source', 'mime', 'count']),
 });

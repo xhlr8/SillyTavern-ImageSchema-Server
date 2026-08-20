@@ -275,6 +275,22 @@ async function geminiInteractionsAdapter(profile, request, options = {}) {
     const response = await checkedFetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal }, profile, fetchImpl, { diagnostics, scope, profile: profileName });
     const json = await responseJson(response, maxBytes, 'Gemini Interactions');
     const image = interactionImage(json);
+    const steps = Array.isArray(json?.steps) ? json.steps : [];
+    const imageBlockCount = steps.reduce((total, step) => total + (Array.isArray(step?.content)
+        ? step.content.filter(item => typeof item?.data === 'string' && /^image\//i.test(String(item.mime_type ?? item.mimeType ?? ''))).length
+        : 0), 0);
+    const interactionSource = imageBlockCount ? 'steps' : typeof json?.output_image?.data === 'string' ? 'output_image' : 'none';
+    recordDiagnostic(diagnostics, {
+        scope,
+        event: 'provider.response',
+        action: 'interactions',
+        profile: profileName,
+        status: response.status,
+        stage: String(json?.status ?? 'unknown').toLowerCase(),
+        outcome: image ? 'image' : 'no_image',
+        source: interactionSource,
+        count: Math.max(imageBlockCount, typeof json?.output_image?.data === 'string' ? 1 : 0),
+    });
     if (!image) {
         const rejected = String(json?.status ?? '').toLowerCase() === 'failed' || JSON.stringify(json?.steps ?? []).match(/safety|blocked|policy/i);
         throw new PluginError(rejected ? 'Gemini rejected the prompt' : 'Gemini Interactions response contained no image', { status: rejected ? 400 : 502, code: rejected ? 'safety' : 'invalid_upstream_response' });
@@ -942,7 +958,7 @@ export class ImageService {
             this.#record({ level: 'error', event: 'generation.complete', action, status: error?.status ?? 500, code: error?.code ?? 'internal_error', durationMs: Date.now() - startedAt });
             throw error;
         }
-        const detail = { action, profile: prepared.request.profile };
+        const detail = { action, profile: prepared.request.profile, requestId: randomUUID() };
         try {
             // Durable outputs are authoritative and are consulted even when the
             // internal cache is bypassed (for example after a browser _refresh).
@@ -950,7 +966,14 @@ export class ImageService {
             if (durable) {
                 this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: durable.data.length });
                 this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: durable.data.length, durationMs: Date.now() - startedAt });
-                return { ...durable, key: prepared.key, request: prepared.request };
+                return {
+                    ...durable,
+                    key: prepared.key,
+                    request: prepared.request,
+                    requestedProfile: durable.metadata?.requestedProfile ?? prepared.request.profile,
+                    effectiveProfile: durable.metadata?.effectiveProfile ?? durable.metadata?.profile ?? prepared.request.profile,
+                    fallbackReason: durable.metadata?.fallbackReason ?? null,
+                };
             }
             if (!bypassCache) {
                 const hit = await this.cache?.get(prepared.key);
@@ -966,7 +989,14 @@ export class ImageService {
                         : hit;
                     this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: promoted.data.length });
                     this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: promoted.data.length, durationMs: Date.now() - startedAt });
-                    return { ...promoted, key: prepared.key, request: prepared.request };
+                    return {
+                        ...promoted,
+                        key: prepared.key,
+                        request: prepared.request,
+                        requestedProfile: promoted.metadata?.requestedProfile ?? prepared.request.profile,
+                        effectiveProfile: promoted.metadata?.effectiveProfile ?? promoted.metadata?.profile ?? prepared.request.profile,
+                        fallbackReason: promoted.metadata?.fallbackReason ?? null,
+                    };
                 }
                 this.#record({ event: 'cache.lookup', ...detail, cache: 'miss' });
             } else {
@@ -1024,7 +1054,16 @@ export class ImageService {
                 status: error?.status ?? 502,
                 code,
             });
-            return this.#generateOwned(fallbackPrepared, signal);
+            try {
+                return await this.#generateOwned(fallbackPrepared, signal);
+            } catch (fallbackError) {
+                fallbackError.imageProvenance = {
+                    requestedProfile: prepared.request.profile,
+                    effectiveProfile: routing.fallbackProfile,
+                    fallbackReason: code,
+                };
+                throw fallbackError;
+            }
         }
     }
 
@@ -1049,12 +1088,22 @@ export class ImageService {
             ? await this.outputs.set(prepared.key, result, {
                 request: prepared.request,
                 profileFingerprint: prepared.profileFingerprint,
+                requestedProfile: prepared.requestedProfile ?? prepared.request.profile,
+                effectiveProfile: prepared.request.profile,
+                fallbackReason: prepared.fallbackReason ?? null,
             })
             : { ...result, etag: createHash('sha256').update(result.data).digest('hex'), cached: false };
         // Internal cache is only an accelerator. Failure to populate it must not
         // invalidate a successfully persisted authoritative output.
         if (this.cache) await this.cache.set(prepared.key, durable).catch(() => {});
-        return { ...durable, key: prepared.key, request: prepared.request };
+        return {
+            ...durable,
+            key: prepared.key,
+            request: prepared.request,
+            requestedProfile: durable.metadata?.requestedProfile ?? prepared.requestedProfile ?? prepared.request.profile,
+            effectiveProfile: durable.metadata?.effectiveProfile ?? durable.metadata?.profile ?? prepared.request.profile,
+            fallbackReason: durable.metadata?.fallbackReason ?? prepared.fallbackReason ?? null,
+        };
     }
 
     #record(event) {

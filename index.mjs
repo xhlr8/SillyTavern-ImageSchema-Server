@@ -88,6 +88,9 @@ function sendImage(request, response, result, config) {
         ...(isError ? {} : { ETag: `"${etag}"` }),
         'X-Content-Type-Options': 'nosniff',
         'X-Image-Cache': isError ? 'ERROR' : (result.cached ? 'HIT' : 'MISS'),
+        ...(result.effectiveProfile ? { 'X-Image-Profile': result.effectiveProfile } : {}),
+        ...(result.requestedProfile ? { 'X-Image-Requested-Profile': result.requestedProfile } : {}),
+        ...(result.fallbackReason ? { 'X-Image-Fallback-Reason': result.fallbackReason } : {}),
     });
     if (!isError && etagMatches(request.headers['if-none-match'], etag)) return response.status(304).end();
     response.set({
@@ -104,7 +107,7 @@ function builtInErrorImage(error) {
     const accent = rejected ? '#ff8fa3' : '#ffb86b';
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="768" height="384" viewBox="0 0 768 384"><rect width="768" height="384" rx="24" fill="#151722"/><rect x="12" y="12" width="744" height="360" rx="18" fill="none" stroke="${accent}" stroke-width="4"/><text x="384" y="176" text-anchor="middle" fill="${accent}" font-family="system-ui,sans-serif" font-size="42" font-weight="700">${title}</text><text x="384" y="226" text-anchor="middle" fill="#d8d9e8" font-family="system-ui,sans-serif" font-size="20">${subtitle}</text></svg>`;
     const data = Buffer.from(svg, 'utf8');
-    return { data, mime: 'image/svg+xml', etag: createHash('sha256').update(data).digest('hex'), cached: false, error: true };
+    return { data, mime: 'image/svg+xml', etag: createHash('sha256').update(data).digest('hex'), cached: false, error: true, errorCode: error.code };
 }
 
 function errorImage(_config, error) {
@@ -285,7 +288,9 @@ export async function init(router) {
             const fallback = imageEligible ? await errorImage(config, error) : null;
             if (fallback) {
                 response.set('X-Image-Error', error.code);
-                return sendImage(request, response, fallback, config);
+                const requestedProfile = generationInput(request, true).profile || config.defaultProfile;
+                const provenance = rawError?.imageProvenance ?? { requestedProfile, effectiveProfile: requestedProfile };
+                return sendImage(request, response, { ...fallback, ...provenance }, config);
             }
             return response.status(error.status).type('text/plain').send(`${error.code}: ${error.message}`);
         }

@@ -18,6 +18,7 @@ import {
     sniffMime,
     validateConfig,
 } from '../core.mjs';
+import { ActivityDiagnostics } from '../diagnostics.mjs';
 
 const PNG = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
 const jsonResponse = value => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -101,6 +102,43 @@ test('Gemini 3 adapter reads image output from the Interactions API', async () =
     assert.deepEqual(captured.body.response_format, { type: 'image' });
     assert.match(captured.body.input[0].text, /Create exactly one image/);
     assert.equal(captured.headers.authorization, 'Bearer secret');
+});
+
+test('Gemini Interactions accepts output_image and records only safe response shape', async () => {
+    const diagnostics = new ActivityDiagnostics({ limit: 10 });
+    const result = await geminiSseAdapter({
+        type: 'gemini-sse', url: 'https://proxy.example.test/google-ai', apiKey: 'secret',
+    }, { prompt: 'private cat prompt', width: 512, height: 512, negative: '', model: 'gemini-3-pro-image' }, {
+        diagnostics,
+        scope: 'gemini-user',
+        profileName: 'gemini',
+        fetchImpl: async () => jsonResponse({
+            status: 'completed',
+            steps: [{ type: 'thought', content: [{ type: 'text', text: 'private reasoning' }] }],
+            output_image: { mime_type: 'image/png', data: PNG.toString('base64') },
+        }),
+    });
+    assert.equal(result.mime, 'image/png');
+    const shape = diagnostics.recent({ scope: 'gemini-user' }).find(event => event.event === 'provider.response');
+    assert.deepEqual({ stage: shape.stage, outcome: shape.outcome, source: shape.source, count: shape.count }, {
+        stage: 'completed', outcome: 'image', source: 'output_image', count: 1,
+    });
+    const serialized = JSON.stringify(shape);
+    for (const forbidden of ['private cat prompt', 'private reasoning', PNG.toString('base64'), 'secret']) assert.doesNotMatch(serialized, new RegExp(forbidden));
+});
+
+test('Gemini Interactions records a safe no-image shape before failing', async () => {
+    const diagnostics = new ActivityDiagnostics({ limit: 10 });
+    await assert.rejects(geminiSseAdapter({
+        type: 'gemini-sse', url: 'https://proxy.example.test/google-ai',
+    }, { prompt: 'private prompt', width: 512, height: 512, negative: '', model: 'gemini-3-pro-image' }, {
+        diagnostics,
+        scope: 'gemini-user',
+        profileName: 'gemini',
+        fetchImpl: async () => jsonResponse({ status: 'completed', steps: [{ type: 'model_output', content: [{ type: 'text', text: 'no image' }] }] }),
+    }), error => error.code === 'invalid_upstream_response');
+    const shape = diagnostics.recent({ scope: 'gemini-user' }).find(event => event.event === 'provider.response');
+    assert.deepEqual({ outcome: shape.outcome, source: shape.source, count: shape.count }, { outcome: 'no_image', source: 'none', count: 0 });
 });
 
 test('legacy Gemini SSE adapter reads inline image across standard SSE events', async () => {
@@ -341,6 +379,46 @@ test('clearing internal cache leaves durable output reusable until explicitly cl
     assert.equal(calls, 1);
     await outputs.clear();
     assert.equal((await outputs.stats()).entries, 0);
+});
+
+test('mixed durable hit and generation miss remain independent', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-mixed-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const cache = new DiskCache({ directory: path.join(root, 'cache') });
+    const outputs = new OutputStore({ directory: path.join(root, 'outputs') });
+    const diagnostics = new ActivityDiagnostics({ limit: 30 });
+    const config = { defaultProfile: 'p', profiles: { p: { type: 'generic', url: 'https://fixed.test/{prompt}', defaults: {} } } };
+    const calls = [];
+    const service = new ImageService(config, {
+        cache,
+        outputs,
+        diagnostics,
+        scope: 'mixed-user',
+        fetchImpl: async url => {
+            calls.push(String(url));
+            return new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } });
+        },
+    });
+
+    const primed = await service.generate({ prompt: 'cached' });
+    calls.length = 0;
+    const [hit, miss] = await Promise.all([
+        service.generate({ prompt: 'cached' }),
+        service.generate({ prompt: 'new' }),
+    ]);
+
+    assert.equal(hit.key, primed.key);
+    assert.equal(hit.cached, true);
+    assert.equal(miss.cached, false);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /\/new$/);
+    const completed = diagnostics.recent({ scope: 'mixed-user' }).filter(event => event.event === 'generation.complete');
+    const hitEvent = completed.find(event => event.cache === 'hit');
+    const missEvent = completed.find(event => event.cache === 'miss');
+    assert.match(hitEvent.requestId, /^[0-9a-f-]{36}$/);
+    assert.match(missEvent.requestId, /^[0-9a-f-]{36}$/);
+    assert.notEqual(hitEvent.requestId, missEvent.requestId);
+    assert.notEqual(hitEvent.requestId, hit.key.slice(0, 12));
 });
 
 test('fallback routing retries one eligible provider failure and shares one durable key', async t => {

@@ -58,6 +58,12 @@ test('diagnostics enforce allowlisted fields, redact unsafe input, and remain bo
             durationMs: index,
             status: index === 4 ? 502 : 200,
             code: index === 4 ? 'connection_error' : undefined,
+            requestId: '123e4567-e89b-12d3-a456-426614174000',
+            stage: 'completed',
+            outcome: 'image',
+            source: 'steps',
+            mime: 'image/png',
+            count: 1,
             bytes: 12,
             scope: 'user-a',
             prompt: `private prompt ${secret}`,
@@ -73,12 +79,12 @@ test('diagnostics enforce allowlisted fields, redact unsafe input, and remain bo
     const events = diagnostics.recent({ scope: 'user-a' });
     assert.deepEqual(events.map(event => event.event), ['generation.2', 'generation.3', 'generation.4']);
     assert.equal(events[2].profile, undefined, 'unsafe profile labels are omitted rather than copied');
-    assert.deepEqual(Object.keys(events[2]).sort(), ['action', 'bytes', 'cache', 'code', 'durationMs', 'event', 'level', 'status', 'timestamp']);
+    assert.deepEqual(Object.keys(events[2]).sort(), ['action', 'bytes', 'cache', 'code', 'count', 'durationMs', 'event', 'level', 'mime', 'outcome', 'requestId', 'source', 'stage', 'status', 'timestamp']);
     const serialized = JSON.stringify(events);
     for (const forbidden of [secret, 'prompt', 'negative', 'https://', 'apiKey', 'headers', 'body', 'raw upstream']) {
         assert.equal(serialized.includes(forbidden), false, `diagnostics contained forbidden value: ${forbidden}`);
     }
-    assert.deepEqual([...diagnosticsContract.fields].sort(), ['action', 'bytes', 'cache', 'code', 'durationMs', 'event', 'level', 'profile', 'status', 'timestamp'].sort());
+    assert.deepEqual([...diagnosticsContract.fields].sort(), ['action', 'bytes', 'cache', 'code', 'count', 'durationMs', 'event', 'level', 'mime', 'outcome', 'profile', 'requestId', 'source', 'stage', 'status', 'timestamp'].sort());
 });
 
 test('diagnostics are user scoped by default and support explicit global clear', () => {
