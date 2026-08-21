@@ -77,6 +77,8 @@ outputs/<hashed-user-scope>/<request-key>.json
 
 The internal cache is only an accelerator. A second browser or phone using the same authenticated SillyTavern user and normalized request receives the durable bytes without rerunning the provider. Legacy cache hits are promoted to outputs automatically.
 
+Each successful output has an immutable 64-character `outputId`. The normalized request key is the first output's ID; explicit regeneration creates a new immutable revision ID and advances a small per-request current pointer without overwriting either revision. Exact retrieval is scoped to the authenticated user and does not consult current profiles, models, workflows, or routing.
+
 Metadata stores a prompt hash by default; set `outputs.includePrompt: true` only if raw prompt retention is desired.
 
 Useful routes under `/api/plugins/image-schema`:
@@ -90,7 +92,34 @@ POST /providers/comfy/analyze
 GET  /diagnostics/recent
 GET  /outputs/stats
 POST /outputs/clear
+POST /resolve
+POST /outputs/resolve
+POST /outputs/regenerate
+GET  /outputs/:outputId
 ```
+
+`POST /resolve` and `POST /outputs/resolve` accept `{ "request": <normalized request>, "regenerate"?: boolean }` and return:
+
+```json
+{
+  "outputId": "<immutable id>",
+  "requestKey": "<normalized request key>",
+  "outputUrl": "/api/plugins/image-schema/outputs/<outputId>",
+  "metadata": {
+    "mime": "image/png",
+    "bytes": 123,
+    "etag": "<sha256>",
+    "createdAt": "<ISO timestamp>",
+    "cached": true,
+    "requestedProfile": "example-openai",
+    "effectiveProfile": "example-openai",
+    "fallbackReason": null,
+    "revisionOf": null
+  }
+}
+```
+
+Resolution reuses the current exact or compatible durable output before provider generation. Ordinary reloads do not regenerate. Use `{ "regenerate": true }` or `POST /outputs/regenerate` for an explicit new revision. `GET /outputs/:outputId` serves the exact authenticated-user bytes with private immutable caching and returns `output_not_found` (404) when absent.
 
 `/cache/clear` clears only the accelerator cache. Durable output deletion is explicit.
 
@@ -100,6 +129,7 @@ POST /outputs/clear
 - Provider URLs come from server-managed profiles, not model output.
 - Managed config uses atomic writes and restricted permissions where supported.
 - Diagnostic events omit prompts, URLs, headers, bodies, credentials, and raw upstream errors.
+- Durable output directories and exact retrieval are always authenticated-user scoped, even when accelerator caching is shared.
 - Server plugins are unsandboxed; install only trusted code.
 
 ## Development

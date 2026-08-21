@@ -764,6 +764,16 @@ async function atomicCreate(file, data) {
     }
 }
 
+async function atomicReplace(file, data) {
+    const temp = `${file}.${process.pid}-${randomUUID()}.tmp`;
+    try {
+        await writeFile(temp, data, { flag: 'wx' });
+        await rename(temp, file);
+    } finally {
+        await rm(temp, { force: true }).catch(() => {});
+    }
+}
+
 /**
  * Durable, authoritative generated outputs. Entries deliberately have no TTL:
  * browser caches and the internal DiskCache may be cleared without discarding
@@ -791,6 +801,11 @@ export class OutputStore {
         return path.join(this.directory, `${key}.${outputExtension(mime)}`);
     }
 
+    currentPath(requestKey) {
+        this.metadataPath(requestKey);
+        return path.join(this.directory, `${requestKey}.current.json`);
+    }
+
     async get(key) {
         if (!this.enabled) return null;
         this.metadataPath(key);
@@ -807,6 +822,33 @@ export class OutputStore {
             if (error?.code === 'ENOENT' || error instanceof SyntaxError) return null;
             throw error;
         }
+    }
+
+    async getCurrent(requestKey) {
+        if (!this.enabled) return null;
+        let pointer;
+        try { pointer = JSON.parse(await readFile(this.currentPath(requestKey), 'utf8')); }
+        catch (error) {
+            if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+        }
+        if (pointer?.requestKey === requestKey && /^[a-f0-9]{64}$/.test(String(pointer.outputId))) {
+            const current = await this.get(pointer.outputId);
+            const storedRequestKey = current?.metadata?.requestKey ?? current?.metadata?.key;
+            if (current && storedRequestKey === requestKey) return current;
+        }
+        return this.get(requestKey);
+    }
+
+    async setCurrent(requestKey, outputId) {
+        if (!this.enabled) return;
+        this.currentPath(requestKey);
+        this.metadataPath(outputId);
+        const output = await this.get(outputId);
+        const storedRequestKey = output?.metadata?.requestKey ?? output?.metadata?.key;
+        if (!output || storedRequestKey !== requestKey) {
+            throw new PluginError('Output revision does not belong to this request', { status: 400, code: 'invalid_request' });
+        }
+        await atomicReplace(this.currentPath(requestKey), `${JSON.stringify({ requestKey, outputId, updatedAt: new Date().toISOString() }, null, 2)}\n`);
     }
 
     async findCompatible(request, profileAliases = {}) {
@@ -833,7 +875,7 @@ export class OutputStore {
         return null;
     }
 
-    async set(key, result, { request, profileFingerprint, requestedProfile, effectiveProfile, fallbackReason = null } = {}) {
+    async set(key, result, { request, requestKey = key, revisionOf = null, profileFingerprint, requestedProfile, effectiveProfile, fallbackReason = null } = {}) {
         const data = Buffer.from(result.data);
         const mime = sniffMime(data, result.mime);
         const etag = createHash('sha256').update(data).digest('hex');
@@ -866,6 +908,9 @@ export class OutputStore {
             const createdAt = new Date().toISOString();
             const metadata = {
                 key,
+                outputId: key,
+                requestKey,
+                revisionOf,
                 createdAt,
                 mime,
                 etag,
@@ -915,7 +960,7 @@ export class OutputStore {
     async clear() {
         if (!this.enabled) return { removed: 0 };
         await this.init();
-        const names = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.(?:json|png|jpg|webp|gif|avif|svg)$/.test(name));
+        const names = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.(?:(?:current\.)?json|png|jpg|webp|gif|avif|svg)$/.test(name));
         await Promise.all(names.map(name => rm(path.join(this.directory, name), { force: true })));
         return { removed: names.length };
     }
@@ -981,7 +1026,7 @@ export class ImageService {
         return { ...normalized, key, profileFingerprint, routing };
     }
 
-    async generate(input, { bypassCache = false, signal, action = 'generate' } = {}) {
+    async generate(input, { bypassCache = false, regenerate = false, signal, action = 'generate' } = {}) {
         const startedAt = Date.now();
         let prepared;
         try {
@@ -990,27 +1035,41 @@ export class ImageService {
             this.#record({ level: 'error', event: 'generation.complete', action, status: error?.status ?? 500, code: error?.code ?? 'internal_error', durationMs: Date.now() - startedAt });
             throw error;
         }
+        const requestKey = prepared.key;
+        if (regenerate) {
+            // An explicit regeneration is a new immutable revision. Never reuse
+            // the request key or overwrite bytes that a client may have pinned.
+            prepared = {
+                ...prepared,
+                key: fingerprint({ version: 1, requestKey, revision: randomUUID() }),
+                requestKey,
+                revisionOf: requestKey,
+            };
+        }
         const detail = { action, profile: prepared.request.profile, requestId: randomUUID() };
         try {
             // Durable outputs are authoritative and are consulted even when the
             // internal cache is bypassed (for example after a browser _refresh).
-            const durable = await this.outputs?.get(prepared.key);
+            const durable = regenerate ? null : await this.outputs?.getCurrent(prepared.key);
             if (durable) {
                 this.#record({ event: 'cache.lookup', ...detail, cache: 'hit', status: 200, bytes: durable.data.length });
                 this.#record({ event: 'generation.complete', ...detail, cache: 'hit', status: 200, bytes: durable.data.length, durationMs: Date.now() - startedAt });
                 return {
                     ...durable,
-                    key: prepared.key,
+                    key: durable.metadata?.outputId ?? durable.metadata?.key ?? prepared.key,
+                    outputId: durable.metadata?.outputId ?? durable.metadata?.key ?? prepared.key,
+                    requestKey,
                     request: prepared.request,
                     requestedProfile: durable.metadata?.requestedProfile ?? prepared.request.profile,
                     effectiveProfile: durable.metadata?.effectiveProfile ?? durable.metadata?.profile ?? prepared.request.profile,
                     fallbackReason: durable.metadata?.fallbackReason ?? null,
                 };
             }
-            const compatible = await this.outputs?.findCompatible(prepared.request, this.config.outputs?.profileAliases);
+            const compatible = regenerate ? null : await this.outputs?.findCompatible(prepared.request, this.config.outputs?.profileAliases);
             if (compatible) {
                 const promoted = await this.outputs.set(prepared.key, compatible, {
                     request: prepared.request,
+                    requestKey,
                     profileFingerprint: prepared.profileFingerprint,
                     requestedProfile: prepared.request.profile,
                     effectiveProfile: prepared.request.profile,
@@ -1021,13 +1080,15 @@ export class ImageService {
                     ...promoted,
                     cached: true,
                     key: prepared.key,
+                    outputId: prepared.key,
+                    requestKey,
                     request: prepared.request,
                     requestedProfile: promoted.metadata?.requestedProfile ?? prepared.request.profile,
                     effectiveProfile: promoted.metadata?.effectiveProfile ?? prepared.request.profile,
                     fallbackReason: promoted.metadata?.fallbackReason ?? null,
                 };
             }
-            if (!bypassCache) {
+            if (!bypassCache && !regenerate) {
                 const hit = await this.cache?.get(prepared.key);
                 if (hit) {
                     // Seamlessly promote legacy DiskCache entries into durable
@@ -1036,6 +1097,7 @@ export class ImageService {
                     const promoted = this.outputs
                         ? await this.outputs.set(prepared.key, hit, {
                             request: prepared.request,
+                            requestKey,
                             profileFingerprint: prepared.profileFingerprint,
                         })
                         : hit;
@@ -1044,6 +1106,8 @@ export class ImageService {
                     return {
                         ...promoted,
                         key: prepared.key,
+                        outputId: prepared.key,
+                        requestKey,
                         request: prepared.request,
                         requestedProfile: promoted.metadata?.requestedProfile ?? prepared.request.profile,
                         effectiveProfile: promoted.metadata?.effectiveProfile ?? promoted.metadata?.profile ?? prepared.request.profile,
@@ -1065,6 +1129,7 @@ export class ImageService {
             const operation = this.#generateWithFallback(prepared, signal).finally(() => this.inflight.delete(prepared.key));
             this.inflight.set(prepared.key, operation);
             const result = await operation;
+            if (regenerate) await this.outputs?.setCurrent(requestKey, result.outputId);
             this.#record({ event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'miss', status: 200, bytes: result.data.length, durationMs: Date.now() - startedAt });
             return result;
         } catch (error) {
@@ -1094,6 +1159,8 @@ export class ImageService {
                 // One logical request has one durable output key regardless of
                 // whether primary or fallback produced it.
                 key: prepared.key,
+                requestKey: prepared.requestKey ?? prepared.key,
+                revisionOf: prepared.revisionOf ?? null,
                 profileFingerprint: routing.profileFingerprint,
                 routing: { enabled: false, fallbackProfile: null, fallbackOn: [] },
                 requestedProfile: prepared.request.profile,
@@ -1139,6 +1206,8 @@ export class ImageService {
         const durable = this.outputs
             ? await this.outputs.set(prepared.key, result, {
                 request: prepared.request,
+                requestKey: prepared.requestKey ?? prepared.key,
+                revisionOf: prepared.revisionOf ?? null,
                 profileFingerprint: prepared.profileFingerprint,
                 requestedProfile: prepared.requestedProfile ?? prepared.request.profile,
                 effectiveProfile: prepared.request.profile,
@@ -1151,6 +1220,8 @@ export class ImageService {
         return {
             ...durable,
             key: prepared.key,
+            outputId: prepared.key,
+            requestKey: prepared.requestKey ?? prepared.key,
             request: prepared.request,
             requestedProfile: durable.metadata?.requestedProfile ?? prepared.requestedProfile ?? prepared.request.profile,
             effectiveProfile: durable.metadata?.effectiveProfile ?? durable.metadata?.profile ?? prepared.request.profile,

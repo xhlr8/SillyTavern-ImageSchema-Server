@@ -339,6 +339,72 @@ test('renamed profiles recover and promote matching seeded durable outputs', asy
     assert.equal((await outputs.stats()).entries, 2, 'matching output is promoted under the current request key');
 });
 
+test('explicit regeneration creates a new immutable revision without replacing the request output', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-revisions-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const firstBytes = Buffer.concat([PNG, Buffer.from([1])]);
+    const secondBytes = Buffer.concat([PNG, Buffer.from([2])]);
+    let calls = 0;
+    const outputs = new OutputStore({ directory: path.join(root, 'outputs') });
+    const service = new ImageService({
+        defaultProfile: 'p',
+        profiles: { p: { type: 'generic', url: 'https://fixed.test', defaults: {} } },
+    }, {
+        cache: new DiskCache({ directory: path.join(root, 'cache') }),
+        outputs,
+        fetchImpl: async () => new Response(calls++ === 0 ? firstBytes : secondBytes, { status: 200, headers: { 'content-type': 'image/png' } }),
+    });
+
+    const first = await service.generate({ prompt: 'cat', seed: 7 });
+    const revision = await service.generate({ prompt: 'cat', seed: 7 }, { regenerate: true, bypassCache: true });
+    const reloaded = await service.generate({ prompt: 'cat', seed: 7 });
+
+    assert.equal(calls, 2);
+    assert.equal(first.outputId, first.requestKey);
+    assert.notEqual(revision.outputId, first.outputId);
+    assert.equal(revision.requestKey, first.requestKey);
+    assert.equal(revision.metadata.revisionOf, first.requestKey);
+    assert.deepEqual((await outputs.get(first.outputId)).data, firstBytes);
+    assert.deepEqual((await outputs.get(revision.outputId)).data, secondBytes);
+    assert.equal(reloaded.outputId, revision.outputId, 'ordinary reload resolution reuses the explicitly selected current revision');
+    assert.deepEqual(reloaded.data, secondBytes);
+});
+
+test('exact OutputStore retrieval survives changed profile model workflow and routing configuration', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-exact-output-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const outputs = new OutputStore({ directory: path.join(root, 'outputs') });
+    const original = new ImageService({
+        defaultProfile: 'old',
+        profiles: { old: { type: 'generic', url: 'https://old.test', model: 'old-model', defaults: {} } },
+    }, {
+        cache: null,
+        outputs,
+        fetchImpl: async () => new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } }),
+    });
+    const generated = await original.generate({ prompt: 'pinned', seed: 3 });
+
+    const changed = new ImageService({
+        defaultProfile: 'workflow',
+        routing: { enabled: true, fallbackProfile: 'fallback', fallbackOn: ['connection_error'] },
+        profiles: {
+            workflow: {
+                type: 'comfyui', url: 'https://comfy.test', model: 'new-model',
+                workflow: { 1: { class_type: 'Text', inputs: { text: 'changed' } }, 2: { class_type: 'SaveImage', inputs: {} } },
+                bindings: { prompt: { node: '1', input: 'text' } }, outputNode: '2', defaults: {},
+            },
+            fallback: { type: 'generic', url: 'https://fallback.test', defaults: {} },
+        },
+    }, { cache: null, outputs, fetchImpl: async () => { throw new Error('exact retrieval must not generate'); } });
+
+    assert.notEqual(changed.prepare({ prompt: 'pinned', seed: 3 }).key, generated.outputId);
+    const exact = await outputs.get(generated.outputId);
+    assert.deepEqual(exact.data, PNG);
+    assert.equal(exact.metadata.outputId, generated.outputId);
+    assert.equal(exact.metadata.requestKey, generated.requestKey);
+    assert.equal(await outputs.get('f'.repeat(64)), null);
+});
+
 test('OutputStore rejects keys that could escape its configured directory', async t => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'st-image-output-key-'));
     t.after(() => rm(directory, { recursive: true, force: true }));

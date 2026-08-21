@@ -45,7 +45,7 @@ function generationInput(request, includePathPrompt = false) {
     const outer = request.method === 'GET' ? request.query : (request.body ?? {});
     const nested = outer.request && typeof outer.request === 'object' ? outer.request : null;
     const source = nested
-        ? { ...(nested.params && typeof nested.params === 'object' ? nested.params : {}), prompt: nested.text ?? nested.prompt }
+        ? { ...nested, ...(nested.params && typeof nested.params === 'object' ? nested.params : {}), prompt: nested.text ?? nested.prompt }
         : outer;
     let prompt = includePathPrompt ? request.params.prompt : source.prompt;
     if (includePathPrompt && typeof prompt === 'string') {
@@ -76,7 +76,7 @@ function etagMatches(header, etag) {
     return String(header).split(',').map(value => value.trim()).some(value => value === '*' || value.replace(/^W\//, '') === `"${etag}"`);
 }
 
-function sendImage(request, response, result, config) {
+function sendImage(request, response, result, config, { privateCache = false } = {}) {
     const etag = result.etag ?? createHash('sha256').update(result.data).digest('hex');
     const isError = Boolean(result.error);
     const ttl = config.cache?.ttlSeconds;
@@ -84,7 +84,9 @@ function sendImage(request, response, result, config) {
     const maxAge = persistent ? 31536000 : Math.max(0, Number(ttl));
     response.set({
         'Content-Disposition': 'inline',
-        'Cache-Control': isError ? 'no-store' : (persistent ? `public, max-age=${maxAge}, immutable` : `public, max-age=${maxAge}`),
+        'Cache-Control': isError ? 'no-store' : (persistent
+            ? `${privateCache ? 'private' : 'public'}, max-age=${maxAge}, immutable`
+            : `${privateCache ? 'private' : 'public'}, max-age=${maxAge}`),
         ...(isError ? {} : { ETag: `"${etag}"` }),
         'X-Content-Type-Options': 'nosniff',
         'X-Image-Cache': isError ? 'ERROR' : (result.cached ? 'HIT' : 'MISS'),
@@ -121,6 +123,14 @@ function exactBody(request, allowed) {
         if (!allowed.has(key)) throw new PluginError(`Unsupported request field: ${key}`, { status: 400, code: 'invalid_request' });
     }
     return body;
+}
+
+function requireAuthenticated(request, _response, next) {
+    const identity = request.user?.profile?.handle ?? request.user?.id;
+    if (identity === undefined || identity === null || String(identity) === '') {
+        return next(new PluginError('Authentication is required', { status: 401, code: 'unauthorized' }));
+    }
+    return next();
 }
 
 function requireAdmin(request, _response, next) {
@@ -260,7 +270,9 @@ export async function init(router) {
         const scope = diagnosticsScope(request);
         if (!caches.has(scope)) {
             const cacheDirectory = config.cache?.perUser === false ? configuredCacheDirectory : path.join(configuredCacheDirectory, scope);
-            const outputDirectory = config.cache?.perUser === false ? configuredOutputDirectory : path.join(configuredOutputDirectory, scope);
+            // Durable outputs are always user-scoped, even when the disposable
+            // accelerator cache is intentionally shared.
+            const outputDirectory = path.join(configuredOutputDirectory, scope);
             const cache = new DiskCache({ directory: cacheDirectory, enabled: config.cache?.enabled !== false, ttlSeconds: config.cache?.ttlSeconds ?? null });
             const outputStore = new OutputStore({
                 directory: outputDirectory,
@@ -301,6 +313,46 @@ export async function init(router) {
         const result = await service.generate(generationInput(request), { action: 'generate' });
         return sendImage(request, response, result, config);
     }));
+
+    const outputContract = result => ({
+        outputId: result.outputId ?? result.key,
+        requestKey: result.requestKey ?? result.metadata?.requestKey ?? result.key,
+        outputUrl: `/api/plugins/image-schema/outputs/${encodeURIComponent(result.outputId ?? result.key)}`,
+        metadata: {
+            mime: result.mime,
+            bytes: result.data.length,
+            etag: result.etag,
+            createdAt: result.metadata?.createdAt ?? result.createdAt ?? null,
+            cached: Boolean(result.cached),
+            requestedProfile: result.requestedProfile ?? result.metadata?.requestedProfile ?? null,
+            effectiveProfile: result.effectiveProfile ?? result.metadata?.effectiveProfile ?? result.metadata?.profile ?? null,
+            fallbackReason: result.fallbackReason ?? result.metadata?.fallbackReason ?? null,
+            revisionOf: result.metadata?.revisionOf ?? null,
+        },
+    });
+    const resolveOutput = async (request, response, forcedRegenerate = false) => {
+        const body = exactBody(request, new Set(['request', 'regenerate']));
+        if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') {
+            throw new PluginError('regenerate must be boolean', { status: 400, code: 'invalid_request' });
+        }
+        const regenerate = forcedRegenerate || body.regenerate === true;
+        const { service, outputs: outputStore } = await getUserState(request);
+        if (!outputStore.enabled) throw new PluginError('Durable outputs are disabled', { status: 503, code: 'outputs_disabled' });
+        const result = await service.generate(generationInput(request), {
+            // A configured cross-user accelerator is a legacy compatibility
+            // option. Never read it while resolving user-owned durable output.
+            bypassCache: regenerate || config.cache?.perUser === false,
+            regenerate,
+            action: regenerate ? 'output-regenerate' : 'output-resolve',
+        });
+        return response.json(outputContract(result));
+    };
+
+    // JSON resolution is reload-safe by default. Provider regeneration is only
+    // possible through an explicit flag or the explicit regeneration endpoint.
+    router.post('/resolve', requireAuthenticated, asyncRoute(resolveOutput));
+    router.post('/outputs/resolve', requireAuthenticated, asyncRoute(resolveOutput));
+    router.post('/outputs/regenerate', requireAuthenticated, asyncRoute((request, response) => resolveOutput(request, response, true)));
 
     router.get('/status', (_request, response) => response.json({ ok: true, version: '1.2.0', ...profilesPublicView(config) }));
     router.get('/profiles', (_request, response) => response.json(profilesPublicView(config)));
@@ -446,6 +498,19 @@ export async function init(router) {
         const result = await outputStore.stats();
         routeEvent(request, { event: 'output.manage', action: 'stats', status: 200, bytes: result.bytes });
         return response.json(result);
+    }));
+    router.get('/outputs/:outputId', requireAuthenticated, asyncRoute(async (request, response) => {
+        const { outputs: outputStore } = await getUserState(request);
+        const outputId = String(request.params?.outputId ?? '');
+        const result = await outputStore.get(outputId);
+        if (!result) throw new PluginError('Output not found', { status: 404, code: 'output_not_found' });
+        return sendImage(request, response, {
+            ...result,
+            outputId,
+            requestedProfile: result.metadata?.requestedProfile,
+            effectiveProfile: result.metadata?.effectiveProfile ?? result.metadata?.profile,
+            fallbackReason: result.metadata?.fallbackReason,
+        }, config, { privateCache: true });
     }));
     router.post('/outputs/clear', asyncRoute(async (request, response) => {
         const { outputs: outputStore, cache, service } = await getUserState(request);
