@@ -343,6 +343,10 @@ export async function init(router) {
             // option. Never read it while resolving user-owned durable output.
             bypassCache: regenerate || config.cache?.perUser === false,
             regenerate,
+            // First-time client pin migration may recover matching prompt/seed/
+            // parameters even when a provider was renamed or switched. The match
+            // is promoted under the current request key; future loads use outputId.
+            migrateExisting: !regenerate,
             action: regenerate ? 'output-regenerate' : 'output-resolve',
         });
         return response.json(outputContract(result));

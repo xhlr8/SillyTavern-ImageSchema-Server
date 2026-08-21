@@ -851,7 +851,7 @@ export class OutputStore {
         await atomicReplace(this.currentPath(requestKey), `${JSON.stringify({ requestKey, outputId, updatedAt: new Date().toISOString() }, null, 2)}\n`);
     }
 
-    async findCompatible(request, profileAliases = {}) {
+    async findCompatible(request, profileAliases = {}, { anyProfile = false } = {}) {
         if (!this.enabled || request?.seed === null || request?.seed === undefined) return null;
         await this.init();
         const currentProfile = String(request.profile ?? '');
@@ -865,7 +865,7 @@ export class OutputStore {
             let metadata;
             try { metadata = JSON.parse(await readFile(path.join(this.directory, name), 'utf8')); } catch { continue; }
             const storedProfile = String(metadata.effectiveProfile ?? metadata.profile ?? metadata.params?.profile ?? '');
-            if (!acceptedProfiles.has(storedProfile) || metadata.promptHash !== expectedPromptHash || metadata.seed !== request.seed) continue;
+            if ((!anyProfile && !acceptedProfiles.has(storedProfile)) || metadata.promptHash !== expectedPromptHash || metadata.seed !== request.seed) continue;
             const storedParams = { ...(metadata.params ?? {}) };
             delete storedParams.profile;
             if (canonicalize(storedParams) !== expectedCanonical) continue;
@@ -1026,7 +1026,7 @@ export class ImageService {
         return { ...normalized, key, profileFingerprint, routing };
     }
 
-    async generate(input, { bypassCache = false, regenerate = false, signal, action = 'generate' } = {}) {
+    async generate(input, { bypassCache = false, regenerate = false, migrateExisting = false, signal, action = 'generate' } = {}) {
         const startedAt = Date.now();
         let prepared;
         try {
@@ -1065,7 +1065,11 @@ export class ImageService {
                     fallbackReason: durable.metadata?.fallbackReason ?? null,
                 };
             }
-            const compatible = regenerate ? null : await this.outputs?.findCompatible(prepared.request, this.config.outputs?.profileAliases);
+            const compatible = regenerate ? null : await this.outputs?.findCompatible(
+                prepared.request,
+                this.config.outputs?.profileAliases,
+                { anyProfile: migrateExisting },
+            );
             if (compatible) {
                 const promoted = await this.outputs.set(prepared.key, compatible, {
                     request: prepared.request,
