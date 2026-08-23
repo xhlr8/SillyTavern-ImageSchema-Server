@@ -970,7 +970,7 @@ export class OutputStore {
         const expectedParams = publicOutputParams(request);
         delete expectedParams.profile;
         const expectedCanonical = canonicalize(expectedParams);
-        const metadataFiles = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        const metadataFiles = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name)).sort();
         for (const name of metadataFiles) {
             let metadata;
             try { metadata = JSON.parse(await readFile(path.join(this.directory, name), 'utf8')); } catch { continue; }
@@ -1001,15 +1001,20 @@ export class OutputStore {
 
         const lockPath = path.join(this.directory, `${key}.lock`);
         const image = this.imagePath(key, mime);
+        const lockToken = randomUUID();
         let lock;
         try {
             lock = await open(lockPath, 'wx');
+            await lock.writeFile(JSON.stringify({ schemaVersion: 1, token: lockToken, pid: process.pid, createdAt: new Date().toISOString() }));
         } catch (error) {
             if (error?.code !== 'EEXIST') throw error;
             // Recover abandoned persistence locks, but never remove a lock whose
             // mtime still falls inside the configured ownership window.
             if (await this.recoverStaleLock(key)) {
-                try { lock = await open(lockPath, 'wx'); } catch (retryError) { if (retryError?.code !== 'EEXIST') throw retryError; }
+                try {
+                    lock = await open(lockPath, 'wx');
+                    await lock.writeFile(JSON.stringify({ schemaVersion: 1, token: lockToken, pid: process.pid, createdAt: new Date().toISOString() }));
+                } catch (retryError) { if (retryError?.code !== 'EEXIST') throw retryError; }
             }
             if (!lock) {
                 // A second process owns generation/persistence for the same key.
@@ -1046,11 +1051,15 @@ export class OutputStore {
                 promptHash: fingerprint(String(request?.prompt ?? '')),
                 ...(this.includePrompt ? { prompt: String(request?.prompt ?? '') } : {}),
             };
+            // Metadata is authoritative. Replace a partial image left by a
+            // crashed prior owner before publishing this owner's bytes.
+            await rm(image, { force: true });
+            const ownership = JSON.parse(await readFile(lockPath, 'utf8'));
+            if (ownership?.token !== lockToken) throw new PluginError('Output persistence lock was reclaimed', { status: 503, code: 'output_busy' });
             await atomicCreate(image, data);
             await atomicCreate(this.metadataPath(key), `${JSON.stringify(metadata, null, 2)}\n`);
         } finally {
-            await lock.close().catch(() => {});
-            await rm(lockPath, { force: true }).catch(() => {});
+            await this.releaseLock(lockPath, lock, lockToken).catch(() => {});
         }
 
         const stored = await this.get(key);
@@ -1101,11 +1110,29 @@ export class OutputStore {
         try {
             const details = await stat(lockPath);
             if (Date.now() - details.mtimeMs <= this.staleLockMs) return false;
-            await rm(lockPath, { force: true });
+            // Rename is the compare-and-swap: only one contender can quarantine
+            // the observed stale pathname, and delayed cleanup cannot remove a
+            // newly acquired lock at the canonical path.
+            const quarantine = `${lockPath}.stale-${randomUUID()}.tmp`;
+            try { await rename(lockPath, quarantine); } catch (error) {
+                if (error?.code === 'ENOENT' || error?.code === 'EACCES' || error?.code === 'EPERM') return false;
+                throw error;
+            }
+            await rm(quarantine, { force: true });
             return true;
         } catch (error) {
             if (error?.code === 'ENOENT') return true;
             throw error;
+        }
+    }
+
+    async releaseLock(lockPath, lock, token) {
+        await lock?.close().catch(() => {});
+        try {
+            const record = JSON.parse(await readFile(lockPath, 'utf8'));
+            if (record?.token === token) await rm(lockPath, { force: true });
+        } catch (error) {
+            if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
         }
     }
 
@@ -1120,7 +1147,8 @@ export class OutputStore {
             try {
                 const metadata = JSON.parse(await readFile(path.join(this.directory, name), 'utf8'));
                 const candidate = name.slice(0, -5);
-                if ((metadata.requestKey ?? metadata.key) === requestKey) keys.push(candidate);
+                const candidateRequestKey = metadata.requestKey ?? metadata.key;
+                if (metadata.key === candidate && /^[a-f0-9]{64}$/.test(String(candidateRequestKey)) && candidateRequestKey === requestKey) keys.push(candidate);
             } catch { /* Ignore corrupt metadata. */ }
         }
         return { requestKey, keys: [...new Set(keys)] };
@@ -1210,9 +1238,12 @@ export class OutputStore {
         const leftovers = await readdir(this.directory);
         for (const name of leftovers) {
             const match = name.match(/^([a-f0-9]{64})\.lock$/);
-            if (match) await this.recoverStaleLock(match[1]);
+            if (!match) continue;
+            if (!await this.recoverStaleLock(match[1]) && !busy.includes(match[1])) busy.push(match[1]);
         }
-        if (force) await rm(this.referencesDirectory(), { recursive: true, force: true });
+        // Forced deletion scrubs references per successfully deleted output.
+        // Never remove the whole manifest directory: a live/busy survivor may
+        // still own a valid reference.
         return { removed, outputsRemoved, protected: [...protectedIds], busy };
     }
 

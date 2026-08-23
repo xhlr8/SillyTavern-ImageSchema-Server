@@ -358,6 +358,7 @@ export async function init(router) {
         if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') {
             throw new PluginError('regenerate must be boolean', { status: 400, code: 'invalid_request' });
         }
+        if (forcedMigration && body.regenerate === true) throw new PluginError('Migration cannot be combined with regeneration', { status: 400, code: 'invalid_request' });
         const regenerate = forcedRegenerate || body.regenerate === true;
         const { service, outputs: outputStore } = await getUserState(request);
         if (!outputStore.enabled) throw new PluginError('Durable outputs are disabled', { status: 503, code: 'outputs_disabled' });
@@ -615,18 +616,25 @@ export async function init(router) {
         const existing = await outputStore.get(id);
         if (!existing) throw new PluginError('Output not found', { status: 404, code: 'output_not_found' });
         const result = await outputStore.delete(id, { family: body.family === true, force: body.force === true });
-        if (body.family === true) await cache.delete(existing.metadata?.requestKey ?? id);
+        // DiskCache hits are promotable, so invalidate every identity that could
+        // otherwise resurrect the deliberately deleted durable bytes.
+        await cache.delete(existing.metadata?.requestKey ?? id);
+        for (const removedId of result.outputIds) await cache.delete(removedId);
         routeEvent(request, { event: 'output.manage', action: body.family === true ? 'delete-family' : 'delete', status: 200 });
         return response.json(result);
     }));
-    router.post('/outputs/clear', asyncRoute(async (request, response) => {
+    router.post('/outputs/clear', requireAuthenticated, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['all', 'request', 'force']));
+        if (body.all !== undefined && body.all !== true) throw new PluginError('all must be true when provided', { status: 400, code: 'invalid_request' });
+        if (body.all === true && body.request !== undefined) throw new PluginError('all and request cannot be combined', { status: 400, code: 'invalid_request' });
         const { outputs: outputStore, cache, service } = await getUserState(request);
-        const force = request.body?.force === true;
-        if (request.body?.force !== undefined && typeof request.body.force !== 'boolean') throw new PluginError('force must be boolean', { status: 400, code: 'invalid_request' });
+        const force = body.force === true;
+        if (body.force !== undefined && typeof body.force !== 'boolean') throw new PluginError('force must be boolean', { status: 400, code: 'invalid_request' });
         let result;
         let profile;
-        if (request.body?.all === true || !request.body?.request) {
+        if (body.all === true || body.request === undefined) {
             result = await outputStore.clear({ force });
+            await cache.clear();
         } else {
             const prepared = service.prepare(generationInput(request));
             profile = prepared.request.profile;

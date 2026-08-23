@@ -95,6 +95,8 @@ POST /outputs/clear
 POST /resolve
 POST /outputs/resolve
 POST /outputs/regenerate
+POST /outputs/migrate
+POST /outputs/delete
 GET  /outputs?limit=40&cursor=<opaque>
 GET  /outputs/:outputId
 GET  /outputs/:outputId/thumbnail
@@ -125,7 +127,7 @@ POST /references/remove
 }
 ```
 
-Resolution reuses the current exact or compatible durable output before provider generation. Ordinary reloads do not regenerate. Use `{ "regenerate": true }` or `POST /outputs/regenerate` for an explicit new revision. `GET /outputs/:outputId` serves the exact authenticated-user bytes with private immutable caching and returns `output_not_found` (404) when absent.
+Resolution reuses the current exact durable output first. Seeded compatibility promotion on an ordinary reload is restricted to the exact provider/workflow fingerprint or an explicit `outputs.profileAliases` entry; it never silently adopts arbitrary profile or workflow bytes. Ordinary reloads do not regenerate. Use `{ "regenerate": true }` or `POST /outputs/regenerate` for an explicit new revision. `POST /outputs/migrate` accepts the same request body (without regeneration) and explicitly opts into profile-agnostic recovery when prompt hash, seed, and every non-profile normalized parameter match. `GET /outputs/:outputId` serves the exact authenticated-user bytes with private immutable caching and returns `output_not_found` (404) when absent.
 
 ### Gallery API
 
@@ -141,7 +143,7 @@ Per-chat reference manifests identify a slot by `chatId`, `messageId`, `swipeKey
 - `GET /references/:chatId` lists that user's references for one chat; `POST /references/list` with `{ "chatId": ... }` is the preferred equivalent for IDs containing reserved URL characters.
 - `POST /references/remove` accepts the four identity fields and idempotently removes that reference.
 
-`/cache/clear` clears only the accelerator cache. Durable output deletion is explicit.
+`/cache/clear` clears only the accelerator cache. Durable output deletion is explicit. `POST /outputs/delete` accepts `{ "outputId": "<id>", "family"?: boolean, "force"?: boolean }`; family deletion removes every immutable revision sharing the request key. A normal delete or clear refuses to remove outputs named by an active/history reference manifest (`output_referenced`, 409), while `force` also scrubs those references. `POST /outputs/clear` accepts `{ "all": true, "force"?: boolean }` or `{ "request": {...}, "force"?: boolean }`; clear is authenticated, skips live persistence locks, recovers expired locks, and invalidates promotable accelerator entries.
 
 ## Security
 

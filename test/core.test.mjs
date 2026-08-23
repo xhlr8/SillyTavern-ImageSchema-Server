@@ -381,6 +381,7 @@ test('OutputStore recovers stale persistence locks but respects active locks', a
     await stale.init();
     const staleKey = 'a'.repeat(64);
     await writeFile(path.join(directory, staleKey + '.lock'), 'abandoned');
+    await writeFile(path.join(directory, staleKey + '.png'), Buffer.concat([PNG, Buffer.from([1])]));
     await new Promise(resolve => setTimeout(resolve, 10));
     const recovered = await stale.set(staleKey, { data: PNG, mime: 'image/png' }, { request: { prompt: 'stale' } });
     assert.equal(recovered.metadata.key, staleKey);

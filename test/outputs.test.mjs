@@ -177,6 +177,16 @@ test('explicit same-request regeneration creates a distinct retrievable revision
     );
 });
 
+test('destructive output routes require authentication and strictly validate clear requests', async t => {
+    const { router } = await withPlugin(t);
+    const clear = router.route('POST', '/outputs/clear');
+    const deletion = router.route('POST', '/outputs/delete');
+    await assert.rejects(invoke(clear, { method: 'POST', body: { all: true } }), error => error.status === 401 && error.code === 'unauthorized');
+    await assert.rejects(invoke(deletion, { method: 'POST', body: { outputId: 'a'.repeat(64) } }), error => error.status === 401 && error.code === 'unauthorized');
+    await assert.rejects(invoke(clear, { method: 'POST', user: user('alice'), body: { all: false } }), error => error.status === 400 && error.code === 'invalid_request');
+    await assert.rejects(invoke(clear, { method: 'POST', user: user('alice'), body: { all: true, extra: true } }), error => error.status === 400 && error.code === 'invalid_request');
+});
+
 test('explicit migration route remains opt-in and rejects unsupported resolve flags', async t => {
     const { router } = await withPlugin(t);
     const migrate = router.route('POST', '/outputs/migrate');
@@ -184,13 +194,17 @@ test('explicit migration route remains opt-in and rejects unsupported resolve fl
     const migrated = await invoke(migrate, resolveRequest('alice'));
     assert.match(migrated.body.outputId, /^[a-f0-9]{64}$/);
     await assert.rejects(
+        invoke(migrate, resolveRequest('alice', true)),
+        error => error.status === 400 && error.code === 'invalid_request',
+    );
+    await assert.rejects(
         invoke(resolve, { ...resolveRequest('alice'), body: { ...resolveRequest('alice').body, migrate: true } }),
         error => error.status === 400 && error.code === 'invalid_request',
     );
 });
 
 test('output deletion supports one revision or its whole family and protects references', async t => {
-    const { router } = await withPlugin(t);
+    const { router, calls } = await withPlugin(t);
     const resolve = router.route('POST', '/outputs/resolve');
     const regenerate = router.route('POST', '/outputs/regenerate');
     const deletion = router.route('POST', '/outputs/delete');
@@ -218,6 +232,9 @@ test('output deletion supports one revision or its whole family and protects ref
         invoke(retrieval, { method: 'GET', user: user('alice'), params: { outputId: original.outputId }, headers: {} }),
         error => error.status === 404 && error.code === 'output_not_found',
     );
+    const callsBeforeResolve = calls();
+    await invoke(resolve, resolveRequest('alice'));
+    assert.equal(calls(), callsBeforeResolve + 1, 'deleted family is generated again instead of resurrected from accelerator cache');
 });
 
 test('gallery listing is authenticated, user-scoped, chronological, paginated, and prompt-safe', async t => {
