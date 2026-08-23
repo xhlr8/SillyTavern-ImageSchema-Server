@@ -353,7 +353,7 @@ export async function init(router) {
             revisionOf: result.metadata?.revisionOf ?? null,
         },
     });
-    const resolveOutput = async (request, response, forcedRegenerate = false) => {
+    const resolveOutput = async (request, response, forcedRegenerate = false, forcedMigration = false) => {
         const body = exactBody(request, new Set(['request', 'regenerate']));
         if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') {
             throw new PluginError('regenerate must be boolean', { status: 400, code: 'invalid_request' });
@@ -366,11 +366,11 @@ export async function init(router) {
             // option. Never read it while resolving user-owned durable output.
             bypassCache: regenerate || config.cache?.perUser === false,
             regenerate,
-            // First-time client pin migration may recover matching prompt/seed/
-            // parameters even when a provider was renamed or switched. The match
-            // is promoted under the current request key; future loads use outputId.
-            migrateExisting: !regenerate,
-            action: regenerate ? 'output-regenerate' : 'output-resolve',
+            // Ordinary resolve only considers exact profile fingerprints and
+            // configured aliases. Profile-agnostic recovery requires the explicit
+            // migration endpoint and can never happen silently on reload.
+            migrateExisting: forcedMigration && !regenerate,
+            action: regenerate ? 'output-regenerate' : forcedMigration ? 'output-migrate' : 'output-resolve',
         });
         return response.json(outputContract(result));
     };
@@ -380,6 +380,7 @@ export async function init(router) {
     router.post('/resolve', requireAuthenticated, asyncRoute(resolveOutput));
     router.post('/outputs/resolve', requireAuthenticated, asyncRoute(resolveOutput));
     router.post('/outputs/regenerate', requireAuthenticated, asyncRoute((request, response) => resolveOutput(request, response, true)));
+    router.post('/outputs/migrate', requireAuthenticated, asyncRoute((request, response) => resolveOutput(request, response, false, true)));
 
     router.get('/status', (_request, response) => response.json({ ok: true, version: '1.4.0', ...profilesPublicView(config) }));
     router.get('/profiles', (_request, response) => response.json(profilesPublicView(config)));
@@ -605,16 +606,31 @@ export async function init(router) {
         const { outputs: outputStore } = await getUserState(request);
         return response.json(await outputStore.removeReference(identity));
     }));
+    router.post('/outputs/delete', requireAuthenticated, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['outputId', 'family', 'force']));
+        if (body.family !== undefined && typeof body.family !== 'boolean') throw new PluginError('family must be boolean', { status: 400, code: 'invalid_request' });
+        if (body.force !== undefined && typeof body.force !== 'boolean') throw new PluginError('force must be boolean', { status: 400, code: 'invalid_request' });
+        const { outputs: outputStore, cache } = await getUserState(request);
+        const id = outputId(body.outputId);
+        const existing = await outputStore.get(id);
+        if (!existing) throw new PluginError('Output not found', { status: 404, code: 'output_not_found' });
+        const result = await outputStore.delete(id, { family: body.family === true, force: body.force === true });
+        if (body.family === true) await cache.delete(existing.metadata?.requestKey ?? id);
+        routeEvent(request, { event: 'output.manage', action: body.family === true ? 'delete-family' : 'delete', status: 200 });
+        return response.json(result);
+    }));
     router.post('/outputs/clear', asyncRoute(async (request, response) => {
         const { outputs: outputStore, cache, service } = await getUserState(request);
+        const force = request.body?.force === true;
+        if (request.body?.force !== undefined && typeof request.body.force !== 'boolean') throw new PluginError('force must be boolean', { status: 400, code: 'invalid_request' });
         let result;
         let profile;
         if (request.body?.all === true || !request.body?.request) {
-            result = await outputStore.clear();
+            result = await outputStore.clear({ force });
         } else {
             const prepared = service.prepare(generationInput(request));
             profile = prepared.request.profile;
-            result = await outputStore.delete(prepared.key);
+            result = await outputStore.delete(prepared.key, { family: true, force });
             await cache.delete(prepared.key);
         }
         routeEvent(request, { event: 'output.manage', action: 'clear', profile, status: 200 });

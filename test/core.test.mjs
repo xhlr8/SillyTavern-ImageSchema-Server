@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -337,6 +337,58 @@ test('renamed profiles recover and promote matching seeded durable outputs', asy
     assert.equal(recovered.etag, oldResult.etag);
     assert.deepEqual(recovered.data, PNG);
     assert.equal((await outputs.stats()).entries, 2, 'matching output is promoted under the current request key');
+});
+
+test('ordinary resolution never broadly reuses changed profile bytes, while explicit migration can', async t => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'st-image-explicit-migration-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const outputs = new OutputStore({ directory: path.join(root, 'outputs') });
+    const oldConfig = {
+        defaultProfile: 'old', outputs: { enabled: true },
+        profiles: { old: { type: 'generic', url: 'https://old.test/{prompt}', defaults: {} } },
+    };
+    const oldService = new ImageService(oldConfig, {
+        cache: null, outputs,
+        fetchImpl: async () => new Response(PNG, { status: 200, headers: { 'content-type': 'image/png' } }),
+    });
+    const legacyOrdinary = await oldService.generate({ prompt: 'ordinary', seed: 51 });
+    const legacyExplicit = await oldService.generate({ prompt: 'explicit', seed: 52 });
+
+    const changedConfig = {
+        defaultProfile: 'new', outputs: { enabled: true },
+        profiles: { new: { type: 'generic', url: 'https://different.test/{prompt}', defaults: {} } },
+    };
+    let calls = 0;
+    const changedService = new ImageService(changedConfig, {
+        cache: null, outputs,
+        fetchImpl: async () => {
+            calls++;
+            return new Response(Buffer.concat([PNG, Buffer.from([9])]), { status: 200, headers: { 'content-type': 'image/png' } });
+        },
+    });
+    const ordinary = await changedService.generate({ prompt: 'ordinary', seed: 51 });
+    assert.equal(calls, 1, 'changed profile/workflow bytes are not silently reused');
+    assert.notEqual(ordinary.etag, legacyOrdinary.etag);
+    const migrated = await changedService.generate({ prompt: 'explicit', seed: 52 }, { migrateExisting: true });
+    assert.equal(calls, 1, 'explicit migration reuses a parameter-compatible legacy output');
+    assert.equal(migrated.etag, legacyExplicit.etag);
+});
+
+test('OutputStore recovers stale persistence locks but respects active locks', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'st-image-lock-recovery-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const stale = new OutputStore({ directory, staleLockMs: 5 });
+    await stale.init();
+    const staleKey = 'a'.repeat(64);
+    await writeFile(path.join(directory, staleKey + '.lock'), 'abandoned');
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const recovered = await stale.set(staleKey, { data: PNG, mime: 'image/png' }, { request: { prompt: 'stale' } });
+    assert.equal(recovered.metadata.key, staleKey);
+
+    const activeKey = 'b'.repeat(64);
+    await writeFile(path.join(directory, activeKey + '.lock'), 'active');
+    const active = new OutputStore({ directory, staleLockMs: 60_000 });
+    await assert.rejects(active.delete(activeKey), error => error.code === 'output_busy');
 });
 
 test('explicit regeneration creates a new immutable revision without replacing the request output', async t => {

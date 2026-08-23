@@ -780,11 +780,13 @@ async function atomicReplace(file, data) {
  * the canonical server bytes for a normalized generation key.
  */
 export class OutputStore {
-    constructor({ directory, enabled = true, includePrompt = false } = {}) {
+    constructor({ directory, enabled = true, includePrompt = false, staleLockMs = 5 * 60 * 1000 } = {}) {
         if (!directory) throw new PluginError('outputs.directory is required', { status: 500, code: 'config_error' });
         this.directory = directory;
         this.enabled = Boolean(enabled);
         this.includePrompt = Boolean(includePrompt);
+        this.staleLockMs = Number(staleLockMs);
+        if (!Number.isFinite(this.staleLockMs) || this.staleLockMs < 1) throw new PluginError('outputs staleLockMs must be positive', { status: 500, code: 'config_error' });
     }
 
     async init() {
@@ -959,11 +961,11 @@ export class OutputStore {
         await atomicReplace(this.currentPath(requestKey), `${JSON.stringify({ requestKey, outputId, updatedAt: new Date().toISOString() }, null, 2)}\n`);
     }
 
-    async findCompatible(request, profileAliases = {}, { anyProfile = false } = {}) {
+    async findCompatible(request, profileAliases = {}, { anyProfile = false, profileFingerprint = null } = {}) {
         if (!this.enabled || request?.seed === null || request?.seed === undefined) return null;
         await this.init();
         const currentProfile = String(request.profile ?? '');
-        const acceptedProfiles = new Set([currentProfile, ...(profileAliases[currentProfile] ?? [])]);
+        const explicitAliases = new Set(profileAliases[currentProfile] ?? []);
         const expectedPromptHash = fingerprint(String(request.prompt ?? ''));
         const expectedParams = publicOutputParams(request);
         delete expectedParams.profile;
@@ -973,7 +975,11 @@ export class OutputStore {
             let metadata;
             try { metadata = JSON.parse(await readFile(path.join(this.directory, name), 'utf8')); } catch { continue; }
             const storedProfile = String(metadata.effectiveProfile ?? metadata.profile ?? metadata.params?.profile ?? '');
-            if ((!anyProfile && !acceptedProfiles.has(storedProfile)) || metadata.promptHash !== expectedPromptHash || metadata.seed !== request.seed) continue;
+            // Ordinary resolution only promotes bytes produced by the exact same
+            // provider/workflow fingerprint or an explicitly configured alias.
+            // Broad profile-agnostic matching is reserved for explicit migration.
+            const exactProfile = typeof profileFingerprint === 'string' && metadata.profileFingerprint === profileFingerprint;
+            if ((!anyProfile && !exactProfile && !explicitAliases.has(storedProfile)) || metadata.promptHash !== expectedPromptHash || metadata.seed !== request.seed) continue;
             const storedParams = { ...(metadata.params ?? {}) };
             delete storedParams.profile;
             if (canonicalize(storedParams) !== expectedCanonical) continue;
@@ -1000,14 +1006,21 @@ export class OutputStore {
             lock = await open(lockPath, 'wx');
         } catch (error) {
             if (error?.code !== 'EEXIST') throw error;
-            // A second process owns generation/persistence for the same key.
-            // Wait briefly for its authoritative metadata to become visible.
-            for (let attempt = 0; attempt < 200; attempt++) {
-                const raced = await this.get(key);
-                if (raced) return raced;
-                await new Promise(resolve => setTimeout(resolve, 25));
+            // Recover abandoned persistence locks, but never remove a lock whose
+            // mtime still falls inside the configured ownership window.
+            if (await this.recoverStaleLock(key)) {
+                try { lock = await open(lockPath, 'wx'); } catch (retryError) { if (retryError?.code !== 'EEXIST') throw retryError; }
             }
-            throw new PluginError('Timed out waiting for generated output persistence', { status: 503, code: 'output_busy' });
+            if (!lock) {
+                // A second process owns generation/persistence for the same key.
+                // Wait briefly for its authoritative metadata to become visible.
+                for (let attempt = 0; attempt < 200; attempt++) {
+                    const raced = await this.get(key);
+                    if (raced) return raced;
+                    await new Promise(resolve => setTimeout(resolve, 25));
+                }
+                throw new PluginError('Timed out waiting for generated output persistence', { status: 503, code: 'output_busy' });
+            }
         }
 
         try {
@@ -1048,6 +1061,22 @@ export class OutputStore {
         return { ...stored, cached: false };
     }
 
+    async referenceUsage(keys) {
+        const wanted = new Set(keys);
+        const used = new Set();
+        await mkdir(this.referencesDirectory(), { recursive: true });
+        const names = (await readdir(this.referencesDirectory())).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        for (const name of names) {
+            let reference;
+            try { reference = JSON.parse(await readFile(path.join(this.referencesDirectory(), name), 'utf8')); } catch { continue; }
+            if (wanted.has(reference?.activeOutputId)) used.add(reference.activeOutputId);
+            if (Array.isArray(reference?.historyIds)) {
+                for (const id of reference.historyIds) if (wanted.has(id)) used.add(id);
+            }
+        }
+        return used;
+    }
+
     async removeOutputReferences(key) {
         await mkdir(this.referencesDirectory(), { recursive: true });
         const names = (await readdir(this.referencesDirectory())).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
@@ -1067,32 +1096,124 @@ export class OutputStore {
         }
     }
 
-    async delete(key) {
-        if (!this.enabled) return { removed: 0 };
-        this.metadataPath(key);
-        let metadata;
-        try { metadata = JSON.parse(await readFile(this.metadataPath(key), 'utf8')); } catch { metadata = null; }
-        const files = [this.metadataPath(key)];
-        if (metadata?.mime) {
-            try { files.push(this.imagePath(key, metadata.mime)); } catch { /* Invalid metadata cannot select an arbitrary path. */ }
-        } else {
-            for (const extension of Object.values(MIME_EXTENSIONS)) files.push(path.join(this.directory, `${key}.${extension}`));
+    async recoverStaleLock(key) {
+        const lockPath = path.join(this.directory, `${key}.lock`);
+        try {
+            const details = await stat(lockPath);
+            if (Date.now() - details.mtimeMs <= this.staleLockMs) return false;
+            await rm(lockPath, { force: true });
+            return true;
+        } catch (error) {
+            if (error?.code === 'ENOENT') return true;
+            throw error;
         }
-        const existed = await Promise.all(files.map(async file => {
-            try { await stat(file); return true; } catch { return false; }
-        }));
-        await Promise.allSettled(files.map(file => rm(file, { force: true })));
-        await this.removeOutputReferences(key);
-        return { removed: existed.filter(Boolean).length };
     }
 
-    async clear() {
-        if (!this.enabled) return { removed: 0 };
+    async outputFamily(key) {
+        this.metadataPath(key);
+        let selected;
+        try { selected = JSON.parse(await readFile(this.metadataPath(key), 'utf8')); } catch { selected = null; }
+        const requestKey = /^[a-f0-9]{64}$/.test(String(selected?.requestKey)) ? selected.requestKey : key;
+        const names = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        const keys = [];
+        for (const name of names) {
+            try {
+                const metadata = JSON.parse(await readFile(path.join(this.directory, name), 'utf8'));
+                const candidate = name.slice(0, -5);
+                if ((metadata.requestKey ?? metadata.key) === requestKey) keys.push(candidate);
+            } catch { /* Ignore corrupt metadata. */ }
+        }
+        return { requestKey, keys: [...new Set(keys)] };
+    }
+
+    async delete(key, { family = false, force = false } = {}) {
+        if (!this.enabled) return { removed: 0, outputsRemoved: 0, outputIds: [] };
+        this.metadataPath(key);
         await this.init();
-        const names = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.(?:(?:current\.)?json|png|jpg|webp|gif|avif|svg)$/.test(name));
-        await Promise.all(names.map(name => rm(path.join(this.directory, name), { force: true })));
-        await rm(this.referencesDirectory(), { recursive: true, force: true });
-        return { removed: names.length };
+        const group = await this.outputFamily(key);
+        const targets = family ? group.keys : [key];
+        const protectedIds = [...await this.referenceUsage(targets)];
+        if (protectedIds.length && !force) {
+            throw new PluginError('Output is referenced by a chat manifest; remove the reference or retry with force', { status: 409, code: 'output_referenced' });
+        }
+        for (const id of targets) {
+            const lockPath = path.join(this.directory, `${id}.lock`);
+            try {
+                await stat(lockPath);
+                if (!await this.recoverStaleLock(id)) throw new PluginError('Output is currently being persisted', { status: 409, code: 'output_busy' });
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
+        }
+        let removed = 0;
+        const outputIds = [];
+        for (const id of targets) {
+            let metadata;
+            try { metadata = JSON.parse(await readFile(this.metadataPath(id), 'utf8')); } catch { metadata = null; }
+            const files = [this.metadataPath(id)];
+            if (metadata?.mime) {
+                try { files.push(this.imagePath(id, metadata.mime)); } catch { /* Invalid metadata cannot select an arbitrary path. */ }
+            } else {
+                for (const extension of Object.values(MIME_EXTENSIONS)) files.push(path.join(this.directory, `${id}.${extension}`));
+            }
+            const existed = await Promise.all(files.map(async file => {
+                try { await stat(file); return true; } catch { return false; }
+            }));
+            await Promise.allSettled(files.map(file => rm(file, { force: true })));
+            const count = existed.filter(Boolean).length;
+            removed += count;
+            if (count) outputIds.push(id);
+            if (force) await this.removeOutputReferences(id);
+        }
+
+        const remaining = (await this.outputFamily(group.requestKey)).keys.filter(id => !targets.includes(id));
+        if (family || !remaining.length) {
+            await rm(this.currentPath(group.requestKey), { force: true });
+        } else {
+            let pointer;
+            try { pointer = JSON.parse(await readFile(this.currentPath(group.requestKey), 'utf8')); } catch { pointer = null; }
+            if (targets.includes(pointer?.outputId)) {
+                const candidates = [];
+                for (const id of remaining) {
+                    try { candidates.push({ id, metadata: JSON.parse(await readFile(this.metadataPath(id), 'utf8')) }); } catch { /* Ignore corrupt entries. */ }
+                }
+                candidates.sort((a, b) => String(b.metadata.createdAt).localeCompare(String(a.metadata.createdAt)) || b.id.localeCompare(a.id));
+                if (candidates[0]) await this.setCurrent(group.requestKey, candidates[0].id);
+                else await rm(this.currentPath(group.requestKey), { force: true });
+            }
+        }
+        return { removed, outputsRemoved: outputIds.length, outputIds, requestKey: group.requestKey, family: Boolean(family) };
+    }
+
+    async clear({ force = false } = {}) {
+        if (!this.enabled) return { removed: 0, outputsRemoved: 0, protected: [], busy: [] };
+        await this.init();
+        const names = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        const ids = names.map(name => name.slice(0, -5));
+        const protectedIds = force ? new Set() : await this.referenceUsage(ids);
+        const busy = [];
+        let removed = 0;
+        let outputsRemoved = 0;
+        for (const id of ids) {
+            if (protectedIds.has(id)) continue;
+            try {
+                const result = await this.delete(id, { force });
+                removed += result.removed;
+                outputsRemoved += result.outputsRemoved;
+            } catch (error) {
+                if (error?.code === 'output_busy') busy.push(id);
+                else throw error;
+            }
+        }
+        // Maintenance cleanup is deliberately lock-aware. Stale locks and orphan
+        // pointers/files may be removed, but active writes and referenced outputs survive.
+        const leftovers = await readdir(this.directory);
+        for (const name of leftovers) {
+            const match = name.match(/^([a-f0-9]{64})\.lock$/);
+            if (match) await this.recoverStaleLock(match[1]);
+        }
+        if (force) await rm(this.referencesDirectory(), { recursive: true, force: true });
+        return { removed, outputsRemoved, protected: [...protectedIds], busy };
     }
 
     async stats() {
@@ -1198,7 +1319,7 @@ export class ImageService {
             const compatible = regenerate ? null : await this.outputs?.findCompatible(
                 prepared.request,
                 this.config.outputs?.profileAliases,
-                { anyProfile: migrateExisting },
+                { anyProfile: migrateExisting, profileFingerprint: prepared.profileFingerprint },
             );
             if (compatible) {
                 const promoted = await this.outputs.set(prepared.key, compatible, {

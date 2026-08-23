@@ -177,6 +177,49 @@ test('explicit same-request regeneration creates a distinct retrievable revision
     );
 });
 
+test('explicit migration route remains opt-in and rejects unsupported resolve flags', async t => {
+    const { router } = await withPlugin(t);
+    const migrate = router.route('POST', '/outputs/migrate');
+    const resolve = router.route('POST', '/outputs/resolve');
+    const migrated = await invoke(migrate, resolveRequest('alice'));
+    assert.match(migrated.body.outputId, /^[a-f0-9]{64}$/);
+    await assert.rejects(
+        invoke(resolve, { ...resolveRequest('alice'), body: { ...resolveRequest('alice').body, migrate: true } }),
+        error => error.status === 400 && error.code === 'invalid_request',
+    );
+});
+
+test('output deletion supports one revision or its whole family and protects references', async t => {
+    const { router } = await withPlugin(t);
+    const resolve = router.route('POST', '/outputs/resolve');
+    const regenerate = router.route('POST', '/outputs/regenerate');
+    const deletion = router.route('POST', '/outputs/delete');
+    const retrieval = router.route('GET', '/outputs/:outputId');
+    const upsert = router.route('POST', '/references/upsert');
+    const original = (await invoke(resolve, resolveRequest('alice'))).body;
+    const revision = (await invoke(regenerate, resolveRequest('alice'))).body;
+
+    const one = await invoke(deletion, { method: 'POST', user: user('alice'), body: { outputId: revision.outputId } });
+    assert.equal(one.body.family, false);
+    assert.deepEqual(one.body.outputIds, [revision.outputId]);
+    assert.equal((await invoke(resolve, resolveRequest('alice'))).body.outputId, original.outputId, 'current pointer falls back to surviving revision');
+
+    const replacement = (await invoke(regenerate, resolveRequest('alice'))).body;
+    const identity = { chatId: 'delete-chat', messageId: '1', swipeKey: '0', slotId: 'image' };
+    await invoke(upsert, { method: 'POST', user: user('alice'), body: { ...identity, activeOutputId: replacement.outputId, historyIds: [original.outputId, replacement.outputId] } });
+    await assert.rejects(
+        invoke(deletion, { method: 'POST', user: user('alice'), body: { outputId: original.outputId, family: true } }),
+        error => error.status === 409 && error.code === 'output_referenced',
+    );
+    const family = await invoke(deletion, { method: 'POST', user: user('alice'), body: { outputId: original.outputId, family: true, force: true } });
+    assert.equal(family.body.family, true);
+    assert.deepEqual(new Set(family.body.outputIds), new Set([original.outputId, replacement.outputId]));
+    await assert.rejects(
+        invoke(retrieval, { method: 'GET', user: user('alice'), params: { outputId: original.outputId }, headers: {} }),
+        error => error.status === 404 && error.code === 'output_not_found',
+    );
+});
+
 test('gallery listing is authenticated, user-scoped, chronological, paginated, and prompt-safe', async t => {
     const { router } = await withPlugin(t);
     const resolve = router.route('POST', '/outputs/resolve');
@@ -269,6 +312,9 @@ test('chat references support scoped upsert, list, update, remove, and output ow
     await invoke(upsert, {
         method: 'POST', user: user('alice'), body: { ...identity, activeOutputId: first.outputId, historyIds: [first.outputId, second.outputId] },
     });
-    await invoke(router.route('POST', '/outputs/clear'), { method: 'POST', user: user('alice'), body: { all: true } });
+    const protectedClear = await invoke(router.route('POST', '/outputs/clear'), { method: 'POST', user: user('alice'), body: { all: true } });
+    assert.deepEqual(new Set(protectedClear.body.protected), new Set([first.outputId, second.outputId]));
+    assert.equal((await invoke(list, { method: 'GET', user: user('alice'), params: { chatId: 'chat/one' } })).body.references.length, 1);
+    await invoke(router.route('POST', '/outputs/clear'), { method: 'POST', user: user('alice'), body: { all: true, force: true } });
     assert.deepEqual((await invoke(list, { method: 'GET', user: user('alice'), params: { chatId: 'chat/one' } })).body.references, []);
 });
