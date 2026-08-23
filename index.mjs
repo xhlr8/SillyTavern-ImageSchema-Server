@@ -381,7 +381,7 @@ export async function init(router) {
     router.post('/outputs/resolve', requireAuthenticated, asyncRoute(resolveOutput));
     router.post('/outputs/regenerate', requireAuthenticated, asyncRoute((request, response) => resolveOutput(request, response, true)));
 
-    router.get('/status', (_request, response) => response.json({ ok: true, version: '1.3.0', ...profilesPublicView(config) }));
+    router.get('/status', (_request, response) => response.json({ ok: true, version: '1.4.0', ...profilesPublicView(config) }));
     router.get('/profiles', (_request, response) => response.json(profilesPublicView(config)));
     // Compatibility route used by existing clients; it remains read-only despite POST.
     router.post('/profiles', (_request, response) => response.json(profilesPublicView(config)));
