@@ -95,7 +95,13 @@ POST /outputs/clear
 POST /resolve
 POST /outputs/resolve
 POST /outputs/regenerate
+GET  /outputs?limit=40&cursor=<opaque>
 GET  /outputs/:outputId
+GET  /outputs/:outputId/thumbnail
+GET  /references/:chatId
+POST /references/list
+POST /references/upsert
+POST /references/remove
 ```
 
 `POST /resolve` and `POST /outputs/resolve` accept `{ "request": <normalized request>, "regenerate"?: boolean }` and return:
@@ -120,6 +126,20 @@ GET  /outputs/:outputId
 ```
 
 Resolution reuses the current exact or compatible durable output before provider generation. Ordinary reloads do not regenerate. Use `{ "regenerate": true }` or `POST /outputs/regenerate` for an explicit new revision. `GET /outputs/:outputId` serves the exact authenticated-user bytes with private immutable caching and returns `output_not_found` (404) when absent.
+
+### Gallery API
+
+All Gallery and reference routes require authentication and are scoped to the current SillyTavern user.
+
+`GET /outputs` returns newest-first durable output metadata. `limit` defaults to 40 and accepts 1–100; pass the opaque `nextCursor` as `cursor` to fetch the next page. Items include output/request/revision IDs, timestamps, MIME/byte/ETag data, provider provenance, safe normalized generation settings, and authenticated output/thumbnail URLs. Prompt hashes are not exposed. Raw prompts are omitted unless both the output already contains one and the current configuration explicitly enables `outputs.includePrompt`.
+
+The initial exact-thumbnail contract intentionally adds no image-processing dependency: `GET /outputs/:outputId/thumbnail` returns the original authenticated-user image bytes, with `X-Thumbnail-Source: original` and `X-Thumbnail-Contract: original-v1`. Listing items likewise report `thumbnail: { "kind": "original", "resized": false }` so clients need not infer resizing.
+
+Per-chat reference manifests identify a slot by `chatId`, `messageId`, `swipeKey`, and `slotId`:
+
+- `POST /references/upsert` accepts those fields plus `activeOutputId` and `historyIds`. Every referenced output must belong to the authenticated user, and history must contain the active ID.
+- `GET /references/:chatId` lists that user's references for one chat; `POST /references/list` with `{ "chatId": ... }` is the preferred equivalent for IDs containing reserved URL characters.
+- `POST /references/remove` accepts the four identity fields and idempotently removes that reference.
 
 `/cache/clear` clears only the accelerator cache. Durable output deletion is explicit.
 

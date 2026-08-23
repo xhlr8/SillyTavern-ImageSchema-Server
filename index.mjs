@@ -168,6 +168,29 @@ function exactObject(value, label) {
     return value;
 }
 
+function boundedIdentifier(value, label) {
+    if (!['string', 'number'].includes(typeof value) || !String(value).trim() || String(value).length > 512) {
+        throw new PluginError(`${label} must be a non-empty string or number of at most 512 characters`, { status: 400, code: 'invalid_request' });
+    }
+    return String(value);
+}
+
+function outputId(value, label = 'outputId') {
+    const normalized = String(value ?? '');
+    if (!/^[a-f0-9]{64}$/.test(normalized)) throw new PluginError(`${label} must be a 64-character output ID`, { status: 400, code: 'invalid_request' });
+    return normalized;
+}
+
+function referenceIdentity(input) {
+    const source = exactObject(input, 'reference');
+    return {
+        chatId: boundedIdentifier(source.chatId, 'chatId'),
+        messageId: boundedIdentifier(source.messageId, 'messageId'),
+        swipeKey: boundedIdentifier(source.swipeKey, 'swipeKey'),
+        slotId: boundedIdentifier(source.slotId, 'slotId'),
+    };
+}
+
 function comfyObjectInfoUrl(value) {
     if (typeof value !== 'string' || value.length > 8192) throw new PluginError('url must be an HTTP(S) URL', { status: 400, code: 'invalid_request' });
     let url;
@@ -503,18 +526,84 @@ export async function init(router) {
         routeEvent(request, { event: 'output.manage', action: 'stats', status: 200, bytes: result.bytes });
         return response.json(result);
     }));
-    router.get('/outputs/:outputId', requireAuthenticated, asyncRoute(async (request, response) => {
+    const galleryItem = entry => {
+        const metadata = entry.metadata;
+        const safeRequest = {};
+        for (const key of ['profile', 'width', 'height', 'seed', 'model', 'quality', 'outputFormat', 'background', 'enhance', 'aspectRatio', 'imageSize', 'temperature', 'personGeneration']) {
+            const value = metadata.params?.[key];
+            if (value !== undefined && value !== null && value !== '') safeRequest[key] = value;
+        }
+        const id = entry.outputId;
+        return {
+            outputId: id,
+            requestKey: metadata.requestKey ?? id,
+            revisionOf: metadata.revisionOf ?? null,
+            createdAt: metadata.createdAt,
+            mime: metadata.mime,
+            bytes: entry.bytes,
+            etag: metadata.etag ?? null,
+            requestedProfile: metadata.requestedProfile ?? metadata.params?.profile ?? null,
+            effectiveProfile: metadata.effectiveProfile ?? metadata.profile ?? null,
+            fallbackReason: metadata.fallbackReason ?? null,
+            ...(config.outputs?.includePrompt === true && Object.hasOwn(metadata, 'prompt') ? { prompt: metadata.prompt } : {}),
+            request: safeRequest,
+            outputUrl: `/api/plugins/image-schema/outputs/${encodeURIComponent(id)}`,
+            thumbnailUrl: `/api/plugins/image-schema/outputs/${encodeURIComponent(id)}/thumbnail`,
+            thumbnail: { kind: 'original', resized: false },
+        };
+    };
+
+    router.get('/outputs', requireAuthenticated, asyncRoute(async (request, response) => {
         const { outputs: outputStore } = await getUserState(request);
-        const outputId = String(request.params?.outputId ?? '');
-        const result = await outputStore.get(outputId);
+        const page = await outputStore.list({ limit: request.query?.limit ?? 40, cursor: request.query?.cursor ?? null });
+        return response.json({ items: page.items.map(galleryItem), nextCursor: page.nextCursor });
+    }));
+
+    const exactOutput = async (request, response, thumbnail = false) => {
+        const { outputs: outputStore } = await getUserState(request);
+        const id = outputId(request.params?.outputId);
+        const result = await outputStore.get(id);
         if (!result) throw new PluginError('Output not found', { status: 404, code: 'output_not_found' });
+        if (thumbnail) response.set({ 'X-Thumbnail-Source': 'original', 'X-Thumbnail-Contract': 'original-v1' });
         return sendImage(request, response, {
             ...result,
-            outputId,
+            outputId: id,
             requestedProfile: result.metadata?.requestedProfile,
             effectiveProfile: result.metadata?.effectiveProfile ?? result.metadata?.profile,
             fallbackReason: result.metadata?.fallbackReason,
         }, config, { privateCache: true });
+    };
+    router.get('/outputs/:outputId/thumbnail', requireAuthenticated, asyncRoute((request, response) => exactOutput(request, response, true)));
+    router.get('/outputs/:outputId', requireAuthenticated, asyncRoute(exactOutput));
+
+    const listReferences = async (request, response, chatIdValue) => {
+        const { outputs: outputStore } = await getUserState(request);
+        const chatId = boundedIdentifier(chatIdValue, 'chatId');
+        return response.json({ chatId, references: await outputStore.listReferences(chatId) });
+    };
+    router.get('/references/:chatId', requireAuthenticated, asyncRoute((request, response) => listReferences(request, response, request.params?.chatId)));
+    router.post('/references/list', requireAuthenticated, asyncRoute((request, response) => {
+        const body = exactBody(request, new Set(['chatId']));
+        return listReferences(request, response, body.chatId);
+    }));
+    router.post('/references/upsert', requireAuthenticated, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['chatId', 'messageId', 'swipeKey', 'slotId', 'activeOutputId', 'historyIds']));
+        const identity = referenceIdentity(body);
+        const activeOutputId = outputId(body.activeOutputId, 'activeOutputId');
+        if (!Array.isArray(body.historyIds) || body.historyIds.length > 200) throw new PluginError('historyIds must be an array of at most 200 output IDs', { status: 400, code: 'invalid_request' });
+        const historyIds = [...new Set(body.historyIds.map((id, index) => outputId(id, `historyIds[${index}]`)))];
+        if (!historyIds.includes(activeOutputId)) throw new PluginError('historyIds must contain activeOutputId', { status: 400, code: 'invalid_request' });
+        const { outputs: outputStore } = await getUserState(request);
+        for (const id of historyIds) {
+            if (!await outputStore.get(id)) throw new PluginError('Referenced output not found', { status: 404, code: 'output_not_found' });
+        }
+        return response.json({ reference: await outputStore.upsertReference({ ...identity, activeOutputId, historyIds }) });
+    }));
+    router.post('/references/remove', requireAuthenticated, asyncRoute(async (request, response) => {
+        const body = exactBody(request, new Set(['chatId', 'messageId', 'swipeKey', 'slotId']));
+        const identity = referenceIdentity(body);
+        const { outputs: outputStore } = await getUserState(request);
+        return response.json(await outputStore.removeReference(identity));
     }));
     router.post('/outputs/clear', asyncRoute(async (request, response) => {
         const { outputs: outputStore, cache, service } = await getUserState(request);

@@ -176,3 +176,99 @@ test('explicit same-request regeneration creates a distinct retrievable revision
         error => error.status === 404 && error.code === 'output_not_found',
     );
 });
+
+test('gallery listing is authenticated, user-scoped, chronological, paginated, and prompt-safe', async t => {
+    const { router } = await withPlugin(t);
+    const resolve = router.route('POST', '/outputs/resolve');
+    const listing = router.route('GET', '/outputs');
+    const thumbnail = router.route('GET', '/outputs/:outputId/thumbnail');
+    const generated = [];
+    for (const [prompt, seed] of [['first private prompt', 1], ['second private prompt', 2], ['third private prompt', 3]]) {
+        generated.push((await invoke(resolve, {
+            method: 'POST', user: user('alice'), body: { request: { prompt, profile: 'fixed', seed, width: 640, height: 480 } },
+        })).body);
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 2));
+    }
+    const bob = await invoke(resolve, {
+        method: 'POST', user: user('bob'), body: { request: { prompt: 'bob secret', profile: 'fixed', seed: 4 } },
+    });
+
+    await assert.rejects(invoke(listing, { method: 'GET', query: {} }), error => error.status === 401 && error.code === 'unauthorized');
+    const firstPage = await invoke(listing, { method: 'GET', user: user('alice'), query: { limit: '2' } });
+    assert.deepEqual(firstPage.body.items.map(item => item.outputId), [generated[2].outputId, generated[1].outputId]);
+    assert.ok(firstPage.body.nextCursor);
+    assert.equal(JSON.stringify(firstPage.body).includes('private prompt'), false);
+    assert.equal(Object.hasOwn(firstPage.body.items[0], 'promptHash'), false);
+    assert.deepEqual(firstPage.body.items[0].request, { profile: 'fixed', width: 640, height: 480, seed: 3, model: 'old-model', enhance: false });
+    assert.deepEqual(firstPage.body.items[0].thumbnail, { kind: 'original', resized: false });
+
+    const secondPage = await invoke(listing, { method: 'GET', user: user('alice'), query: { limit: '2', cursor: firstPage.body.nextCursor } });
+    assert.deepEqual(secondPage.body.items.map(item => item.outputId), [generated[0].outputId]);
+    assert.equal(secondPage.body.nextCursor, null);
+    assert.equal(firstPage.body.items.some(item => item.outputId === bob.body.outputId), false);
+    const bobList = await invoke(listing, { method: 'GET', user: user('bob'), query: {} });
+    assert.deepEqual(bobList.body.items.map(item => item.outputId), [bob.body.outputId]);
+    await assert.rejects(invoke(listing, { method: 'GET', user: user('alice'), query: { cursor: 'not-a-cursor' } }), error => error.status === 400);
+    await assert.rejects(invoke(listing, { method: 'GET', user: user('alice'), query: { cursor: 'eyJ2ZXJzaW9uIjoxLCJjcmVhdGVkQXQiOiJpbnZhbGlkIiwib3V0cHV0SWQiOiJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmIn0' } }), error => error.status === 400);
+    await assert.rejects(invoke(listing, { method: 'GET', user: user('alice'), query: { limit: '101' } }), error => error.status === 400);
+
+    const thumb = await invoke(thumbnail, { method: 'GET', user: user('alice'), params: { outputId: generated[0].outputId }, headers: {} });
+    assert.deepEqual(thumb.body, Buffer.concat([PNG, Buffer.from([1])]));
+    assert.equal(thumb.headers['X-Thumbnail-Source'], 'original');
+    assert.equal(thumb.headers['X-Thumbnail-Contract'], 'original-v1');
+    await assert.rejects(
+        invoke(thumbnail, { method: 'GET', user: user('bob'), params: { outputId: generated[0].outputId }, headers: {} }),
+        error => error.status === 404 && error.code === 'output_not_found',
+    );
+});
+
+test('chat references support scoped upsert, list, update, remove, and output ownership checks', async t => {
+    const { router } = await withPlugin(t);
+    const resolve = router.route('POST', '/outputs/resolve');
+    const upsert = router.route('POST', '/references/upsert');
+    const list = router.route('GET', '/references/:chatId');
+    const listByBody = router.route('POST', '/references/list');
+    const removeReference = router.route('POST', '/references/remove');
+    const first = (await invoke(resolve, { method: 'POST', user: user('alice'), body: { request: { prompt: 'one', profile: 'fixed', seed: 11 } } })).body;
+    const second = (await invoke(resolve, { method: 'POST', user: user('alice'), body: { request: { prompt: 'two', profile: 'fixed', seed: 12 } } })).body;
+    const identity = { chatId: 'chat/one', messageId: '7', swipeKey: '2', slotId: 'portrait' };
+
+    await assert.rejects(invoke(list, { method: 'GET', params: { chatId: 'chat/one' } }), error => error.status === 401);
+    await assert.rejects(invoke(upsert, { method: 'POST', body: { ...identity, activeOutputId: first.outputId, historyIds: [first.outputId] } }), error => error.status === 401);
+    await assert.rejects(invoke(removeReference, { method: 'POST', body: identity }), error => error.status === 401);
+    const created = await invoke(upsert, {
+        method: 'POST', user: user('alice'), body: { ...identity, activeOutputId: first.outputId, historyIds: [first.outputId] },
+    });
+    assert.equal(created.body.reference.schemaVersion, 1);
+    assert.equal(created.body.reference.activeOutputId, first.outputId);
+    const aliceList = await invoke(list, { method: 'GET', user: user('alice'), params: { chatId: 'chat/one' } });
+    assert.equal(aliceList.body.references.length, 1);
+    const bodyList = await invoke(listByBody, { method: 'POST', user: user('alice'), body: { chatId: 'chat/one' } });
+    assert.deepEqual(bodyList.body.references, aliceList.body.references);
+    assert.deepEqual(aliceList.body.references[0].historyIds, [first.outputId]);
+    const bobList = await invoke(list, { method: 'GET', user: user('bob'), params: { chatId: 'chat/one' } });
+    assert.deepEqual(bobList.body.references, []);
+
+    await assert.rejects(
+        invoke(upsert, { method: 'POST', user: user('bob'), body: { ...identity, activeOutputId: first.outputId, historyIds: [first.outputId] } }),
+        error => error.status === 404 && error.code === 'output_not_found',
+    );
+    const updated = await invoke(upsert, {
+        method: 'POST', user: user('alice'), body: { ...identity, activeOutputId: second.outputId, historyIds: [first.outputId, second.outputId] },
+    });
+    assert.equal(updated.body.reference.createdAt, created.body.reference.createdAt);
+    assert.deepEqual(updated.body.reference.historyIds, [first.outputId, second.outputId]);
+
+    const bobRemove = await invoke(removeReference, { method: 'POST', user: user('bob'), body: identity });
+    assert.equal(bobRemove.body.removed, false);
+    assert.equal((await invoke(list, { method: 'GET', user: user('alice'), params: { chatId: 'chat/one' } })).body.references.length, 1);
+    const removed = await invoke(removeReference, { method: 'POST', user: user('alice'), body: identity });
+    assert.equal(removed.body.removed, true);
+    assert.deepEqual((await invoke(list, { method: 'GET', user: user('alice'), params: { chatId: 'chat/one' } })).body.references, []);
+
+    await invoke(upsert, {
+        method: 'POST', user: user('alice'), body: { ...identity, activeOutputId: first.outputId, historyIds: [first.outputId, second.outputId] },
+    });
+    await invoke(router.route('POST', '/outputs/clear'), { method: 'POST', user: user('alice'), body: { all: true } });
+    assert.deepEqual((await invoke(list, { method: 'GET', user: user('alice'), params: { chatId: 'chat/one' } })).body.references, []);
+});

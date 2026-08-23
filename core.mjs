@@ -824,6 +824,114 @@ export class OutputStore {
         }
     }
 
+    async list({ limit = 40, cursor = null } = {}) {
+        if (!this.enabled) return { items: [], nextCursor: null };
+        const parsedLimit = Number(limit);
+        if (!Number.isSafeInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
+            throw new PluginError('limit must be an integer from 1 to 100', { status: 400, code: 'invalid_request' });
+        }
+        let after = null;
+        if (cursor !== null && cursor !== undefined && cursor !== '') {
+            try {
+                const encoded = String(cursor);
+                if (encoded.length > 512 || !/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error('invalid cursor');
+                const decoded = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+                const keys = decoded && typeof decoded === 'object' && !Array.isArray(decoded) ? Object.keys(decoded).sort() : [];
+                const timestamp = typeof decoded?.createdAt === 'string' ? new Date(decoded.createdAt) : null;
+                if (keys.join(',') !== 'createdAt,outputId,version' || decoded.version !== 1
+                    || !timestamp || Number.isNaN(timestamp.valueOf()) || timestamp.toISOString() !== decoded.createdAt
+                    || !/^[a-f0-9]{64}$/.test(String(decoded.outputId))) throw new Error('invalid cursor');
+                after = { createdAt: decoded.createdAt, outputId: String(decoded.outputId) };
+            } catch {
+                throw new PluginError('cursor is invalid', { status: 400, code: 'invalid_request' });
+            }
+        }
+        await this.init();
+        const metadataNames = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        const entries = [];
+        for (const name of metadataNames) {
+            let metadata;
+            try { metadata = JSON.parse(await readFile(path.join(this.directory, name), 'utf8')); } catch { continue; }
+            const outputId = name.slice(0, -5);
+            if (metadata?.key !== outputId || typeof metadata?.mime !== 'string' || typeof metadata?.createdAt !== 'string') continue;
+            let bytes;
+            try { bytes = (await stat(this.imagePath(outputId, metadata.mime))).size; } catch { continue; }
+            entries.push({ outputId, bytes, metadata });
+        }
+        entries.sort((a, b) => b.metadata.createdAt.localeCompare(a.metadata.createdAt) || b.outputId.localeCompare(a.outputId));
+        const remaining = after ? entries.filter(entry => entry.metadata.createdAt < after.createdAt
+            || (entry.metadata.createdAt === after.createdAt && entry.outputId < after.outputId)) : entries;
+        const items = remaining.slice(0, parsedLimit);
+        const tail = items.at(-1);
+        const nextCursor = remaining.length > items.length && tail
+            ? Buffer.from(JSON.stringify({ version: 1, createdAt: tail.metadata.createdAt, outputId: tail.outputId })).toString('base64url')
+            : null;
+        return { items, nextCursor };
+    }
+
+    referencesDirectory() {
+        return path.join(this.directory, 'references');
+    }
+
+    referencePath(reference) {
+        const identity = {
+            chatId: String(reference.chatId), messageId: String(reference.messageId),
+            swipeKey: String(reference.swipeKey), slotId: String(reference.slotId),
+        };
+        return path.join(this.referencesDirectory(), `${fingerprint(identity)}.json`);
+    }
+
+    async upsertReference(reference) {
+        if (!this.enabled) throw new PluginError('Durable outputs are disabled', { status: 503, code: 'outputs_disabled' });
+        await mkdir(this.referencesDirectory(), { recursive: true });
+        const file = this.referencePath(reference);
+        let existing = null;
+        try { existing = JSON.parse(await readFile(file, 'utf8')); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+        const now = new Date().toISOString();
+        const existingCreatedAt = typeof existing?.createdAt === 'string' && !Number.isNaN(new Date(existing.createdAt).valueOf())
+            ? existing.createdAt : null;
+        const stored = { schemaVersion: 1, ...reference, createdAt: existingCreatedAt ?? now, updatedAt: now };
+        await atomicReplace(file, `${JSON.stringify(stored, null, 2)}\n`);
+        return stored;
+    }
+
+    async listReferences(chatId) {
+        if (!this.enabled) return [];
+        await mkdir(this.referencesDirectory(), { recursive: true });
+        const names = (await readdir(this.referencesDirectory())).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        const references = [];
+        for (const name of names) {
+            try {
+                const reference = JSON.parse(await readFile(path.join(this.referencesDirectory(), name), 'utf8'));
+                const ids = Array.isArray(reference?.historyIds) ? reference.historyIds : [];
+                const valid = reference?.schemaVersion === 1 && reference.chatId === chatId
+                    && ['messageId', 'swipeKey', 'slotId'].every(key => typeof reference[key] === 'string' && reference[key].length > 0 && reference[key].length <= 512)
+                    && /^[a-f0-9]{64}$/.test(String(reference.activeOutputId)) && ids.length <= 200
+                    && ids.includes(reference.activeOutputId) && ids.every(id => /^[a-f0-9]{64}$/.test(String(id)))
+                    && this.referencePath(reference) === path.join(this.referencesDirectory(), name);
+                if (valid) references.push({
+                    schemaVersion: 1, chatId: reference.chatId, messageId: reference.messageId, swipeKey: reference.swipeKey, slotId: reference.slotId,
+                    activeOutputId: reference.activeOutputId, historyIds: [...new Set(ids)], createdAt: reference.createdAt, updatedAt: reference.updatedAt,
+                });
+            } catch { /* Ignore incomplete or corrupt records. */ }
+        }
+        references.sort((a, b) => String(a.messageId).localeCompare(String(b.messageId))
+            || String(a.swipeKey).localeCompare(String(b.swipeKey)) || String(a.slotId).localeCompare(String(b.slotId)));
+        return references;
+    }
+
+    async removeReference(reference) {
+        if (!this.enabled) return { removed: false };
+        const file = this.referencePath(reference);
+        try {
+            await rm(file);
+            return { removed: true };
+        } catch (error) {
+            if (error?.code === 'ENOENT') return { removed: false };
+            throw error;
+        }
+    }
+
     async getCurrent(requestKey) {
         if (!this.enabled) return null;
         let pointer;
@@ -914,6 +1022,7 @@ export class OutputStore {
                 createdAt,
                 mime,
                 etag,
+                bytes: data.length,
                 profile: effectiveProfile ?? request?.profile ?? null,
                 requestedProfile: requestedProfile ?? request?.profile ?? null,
                 effectiveProfile: effectiveProfile ?? request?.profile ?? null,
@@ -939,6 +1048,25 @@ export class OutputStore {
         return { ...stored, cached: false };
     }
 
+    async removeOutputReferences(key) {
+        await mkdir(this.referencesDirectory(), { recursive: true });
+        const names = (await readdir(this.referencesDirectory())).filter(name => /^[a-f0-9]{64}\.json$/.test(name));
+        for (const name of names) {
+            const file = path.join(this.referencesDirectory(), name);
+            let reference;
+            try { reference = JSON.parse(await readFile(file, 'utf8')); } catch { continue; }
+            if (reference?.activeOutputId === key) {
+                await rm(file, { force: true });
+                continue;
+            }
+            if (Array.isArray(reference?.historyIds) && reference.historyIds.includes(key)) {
+                reference.historyIds = reference.historyIds.filter(id => id !== key);
+                reference.updatedAt = new Date().toISOString();
+                await atomicReplace(file, `${JSON.stringify(reference, null, 2)}\n`);
+            }
+        }
+    }
+
     async delete(key) {
         if (!this.enabled) return { removed: 0 };
         this.metadataPath(key);
@@ -954,6 +1082,7 @@ export class OutputStore {
             try { await stat(file); return true; } catch { return false; }
         }));
         await Promise.allSettled(files.map(file => rm(file, { force: true })));
+        await this.removeOutputReferences(key);
         return { removed: existed.filter(Boolean).length };
     }
 
@@ -962,6 +1091,7 @@ export class OutputStore {
         await this.init();
         const names = (await readdir(this.directory)).filter(name => /^[a-f0-9]{64}\.(?:(?:current\.)?json|png|jpg|webp|gif|avif|svg)$/.test(name));
         await Promise.all(names.map(name => rm(path.join(this.directory, name), { force: true })));
+        await rm(this.referencesDirectory(), { recursive: true, force: true });
         return { removed: names.length };
     }
 
