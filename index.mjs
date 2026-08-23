@@ -8,6 +8,7 @@ import { DiskCache, ImageService, OutputStore, PluginError, expandEnv, sniffMime
 import { ActivityDiagnostics, diagnosticsContract, diagnosticsScope, isDiagnosticsAdmin, recordDiagnostic } from './diagnostics.mjs';
 import { ManagedProfileStore, profilesPublicView, validateManagedProfile, validateProfileName } from './managed-config.mjs';
 import { analyzeComfyWorkflow, validateComfyWorkflow } from './comfyui.mjs';
+import { GenerationJobQueue } from './jobs.mjs';
 
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
 let state = null;
@@ -181,6 +182,29 @@ function outputId(value, label = 'outputId') {
     return normalized;
 }
 
+function jobId(value) {
+    const normalized = String(value ?? '');
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)) {
+        throw new PluginError('jobId must be a UUID', { status: 400, code: 'invalid_request' });
+    }
+    return normalized;
+}
+
+function generationJobInput(request) {
+    const body = exactBody(request, new Set(['chatId', 'messageId', 'swipeKey', 'slotId', 'action', 'request']));
+    const action = String(body.action ?? '');
+    if (!['resolve', 'regenerate'].includes(action)) throw new PluginError('action must be resolve or regenerate', { status: 400, code: 'invalid_request' });
+    const generationRequest = exactObject(body.request, 'request');
+    return {
+        chatId: boundedIdentifier(body.chatId, 'chatId'),
+        messageId: boundedIdentifier(body.messageId, 'messageId'),
+        swipeKey: boundedIdentifier(body.swipeKey, 'swipeKey'),
+        slotId: boundedIdentifier(body.slotId, 'slotId'),
+        action,
+        request: structuredClone(generationRequest),
+    };
+}
+
 function referenceIdentity(input) {
     const source = exactObject(input, 'reference');
     return {
@@ -289,8 +313,7 @@ export async function init(router) {
         },
     });
     config = await store.load();
-    const getUserState = async request => {
-        const scope = diagnosticsScope(request);
+    const getScopeState = async scope => {
         if (!caches.has(scope)) {
             const cacheDirectory = config.cache?.perUser === false ? configuredCacheDirectory : path.join(configuredCacheDirectory, scope);
             // Durable outputs are always user-scoped, even when the disposable
@@ -309,6 +332,7 @@ export async function init(router) {
         }
         return { cache: caches.get(scope), outputs: outputs.get(scope), service: services.get(scope), scope };
     };
+    const getUserState = request => getScopeState(diagnosticsScope(request));
     const routeEvent = (request, event) => recordDiagnostic(diagnostics, { scope: diagnosticsScope(request), ...event });
     state = { config, baseConfig, configPath, managedPath, store, caches, outputs, services, diagnostics };
 
@@ -353,6 +377,51 @@ export async function init(router) {
             revisionOf: result.metadata?.revisionOf ?? null,
         },
     });
+    const configuredJobConcurrency = Number(config.jobs?.concurrency ?? 1);
+    if (!Number.isSafeInteger(configuredJobConcurrency) || configuredJobConcurrency < 1) {
+        throw new PluginError('jobs.concurrency must be a positive integer', { status: 500, code: 'config_error' });
+    }
+    const jobs = new GenerationJobQueue({
+        concurrency: configuredJobConcurrency,
+        executor: async ({ owner, action, request: generationRequest, signal, updateState }) => {
+            const { service, outputs: outputStore } = await getScopeState(owner);
+            if (!outputStore.enabled) throw new PluginError('Durable outputs are disabled', { status: 503, code: 'outputs_disabled' });
+            const regenerate = action === 'regenerate';
+            const result = await service.generate(generationInput({ method: 'POST', body: { request: generationRequest } }), {
+                bypassCache: regenerate || config.cache?.perUser === false,
+                regenerate, signal,
+                action: regenerate ? 'job-regenerate' : 'job-resolve',
+                onState: updateState,
+                deduplicate: false,
+                enforceConcurrencyLimit: false,
+            });
+            return outputContract(result);
+        },
+    });
+    state.jobs = jobs;
+
+    router.post('/jobs', requireAuthenticated, asyncRoute(async (request, response) => {
+        return response.status(202).json(jobs.create(diagnosticsScope(request), generationJobInput(request)));
+    }));
+    router.get('/jobs', requireAuthenticated, asyncRoute(async (request, response) => {
+        const all = jobs.list(diagnosticsScope(request));
+        return response.json({
+            active: all.filter(item => ['queued', 'resolving', 'provider-running', 'persisting'].includes(item.state)),
+            recent: all.filter(item => ['completed', 'failed', 'cancelled'].includes(item.state)),
+        });
+    }));
+    router.get('/jobs/:jobId', requireAuthenticated, asyncRoute(async (request, response) => {
+        const found = jobs.get(diagnosticsScope(request), jobId(request.params?.jobId));
+        if (!found) throw new PluginError('Generation job not found', { status: 404, code: 'job_not_found' });
+        return response.json(found);
+    }));
+    router.post('/jobs/:jobId/cancel', requireAuthenticated, asyncRoute(async (request, response) => {
+        if (request.body !== undefined) exactBody(request, new Set());
+        const cancelled = jobs.cancel(diagnosticsScope(request), jobId(request.params?.jobId));
+        if (!cancelled) throw new PluginError('Generation job not found', { status: 404, code: 'job_not_found' });
+        return response.json(cancelled);
+    }));
+
     const resolveOutput = async (request, response, forcedRegenerate = false, forcedMigration = false) => {
         const body = exactBody(request, new Set(['request', 'regenerate']));
         if (body.regenerate !== undefined && typeof body.regenerate !== 'boolean') {
@@ -691,6 +760,7 @@ export async function init(router) {
 
 export async function exit() {
     if (state) {
+        state.jobs?.close();
         const inflight = [...state.services.values()].reduce((total, service) => total + service.inflight.size, 0);
         console.log(`[${info.id}] stopped; ${inflight} generation(s) were in flight`);
     }

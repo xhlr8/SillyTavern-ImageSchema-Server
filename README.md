@@ -97,6 +97,10 @@ POST /outputs/resolve
 POST /outputs/regenerate
 POST /outputs/migrate
 POST /outputs/delete
+POST /jobs
+GET  /jobs
+GET  /jobs/:jobId
+POST /jobs/:jobId/cancel
 GET  /outputs?limit=40&cursor=<opaque>
 GET  /outputs/:outputId
 GET  /outputs/:outputId/thumbnail
@@ -126,6 +130,8 @@ POST /references/remove
   }
 }
 ```
+
+The authenticated generation queue accepts `POST /jobs` with `{ "chatId": ..., "messageId": ..., "swipeKey": ..., "slotId": ..., "action": "resolve" | "regenerate", "request": {...} }` and returns a `202` job snapshot. `GET /jobs` lists current/recent jobs for only the current user, `GET /jobs/:jobId` polls one job, and `POST /jobs/:jobId/cancel` with `{}` cancels queued or running provider HTTP/ComfyUI work through `AbortController`. States are `queued`, `resolving`, `provider-running`, `persisting`, `completed`, `failed`, and `cancelled`; terminal records remain available for ten minutes within the running server process. Configure global worker concurrency with `jobs.concurrency` (default `1`). Job metadata and results use the authenticated request/output contracts and do not add prompts to diagnostics or logs.
 
 Resolution reuses the current exact durable output first. Seeded compatibility promotion on an ordinary reload is restricted to the exact provider/workflow fingerprint or an explicit `outputs.profileAliases` entry; it never silently adopts arbitrary profile or workflow bytes. Ordinary reloads do not regenerate. Use `{ "regenerate": true }` or `POST /outputs/regenerate` for an explicit new revision. `POST /outputs/migrate` accepts the same request body (without regeneration) and explicitly opts into profile-agnostic recovery when prompt hash, seed, and every non-profile normalized parameter match. `GET /outputs/:outputId` serves the exact authenticated-user bytes with private immutable caching and returns `output_not_found` (404) when absent.
 

@@ -602,6 +602,10 @@ export function profilePublicView(name, profile, isDefault = false) {
 
 export function validateConfig(config) {
     if (!config || typeof config !== 'object') throw new PluginError('Configuration root must be an object', { status: 500, code: 'config_error' });
+    if (config.jobs !== undefined) {
+        if (!config.jobs || typeof config.jobs !== 'object' || Array.isArray(config.jobs)) throw new PluginError('jobs must be an object', { status: 500, code: 'config_error' });
+        if (config.jobs.concurrency !== undefined && (!Number.isSafeInteger(config.jobs.concurrency) || config.jobs.concurrency < 1)) throw new PluginError('jobs.concurrency must be a positive integer', { status: 500, code: 'config_error' });
+    }
     if (config.outputs !== undefined) {
         if (!config.outputs || typeof config.outputs !== 'object' || Array.isArray(config.outputs)) throw new PluginError('outputs must be an object', { status: 500, code: 'config_error' });
         if (config.outputs.directory !== undefined && (typeof config.outputs.directory !== 'string' || !config.outputs.directory.trim())) throw new PluginError('outputs.directory must be a non-empty string', { status: 500, code: 'config_error' });
@@ -1308,8 +1312,10 @@ export class ImageService {
         return { ...normalized, key, profileFingerprint, routing };
     }
 
-    async generate(input, { bypassCache = false, regenerate = false, migrateExisting = false, signal, action = 'generate' } = {}) {
+    async generate(input, { bypassCache = false, regenerate = false, migrateExisting = false, signal, action = 'generate', onState, deduplicate = true, enforceConcurrencyLimit = true } = {}) {
         const startedAt = Date.now();
+        const reportState = stage => { if (typeof onState === 'function') onState(stage); };
+        reportState('resolving');
         let prepared;
         try {
             prepared = this.prepare(input);
@@ -1404,16 +1410,18 @@ export class ImageService {
             } else {
                 this.#record({ event: 'cache.lookup', ...detail, cache: 'bypass' });
             }
-            if (this.inflight.has(prepared.key)) {
+            if (deduplicate && this.inflight.has(prepared.key)) {
                 const result = await this.inflight.get(prepared.key);
                 this.#record({ event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'miss', status: 200, bytes: result.data.length, durationMs: Date.now() - startedAt });
                 return result;
             }
             const maxConcurrent = Number(this.config.limits?.maxConcurrentRequests ?? 4);
             if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) throw new PluginError('limits.maxConcurrentRequests must be a positive integer', { status: 500, code: 'config_error' });
-            if (this.inflight.size >= maxConcurrent) throw new PluginError('Too many image requests are already running', { status: 429, code: 'rate_limit' });
-            const operation = this.#generateWithFallback(prepared, signal).finally(() => this.inflight.delete(prepared.key));
-            this.inflight.set(prepared.key, operation);
+            if (enforceConcurrencyLimit && this.inflight.size >= maxConcurrent) throw new PluginError('Too many image requests are already running', { status: 429, code: 'rate_limit' });
+            reportState('provider-running');
+            const inflightKey = deduplicate ? prepared.key : `${prepared.key}:${randomUUID()}`;
+            const operation = this.#generateWithFallback(prepared, signal, reportState).finally(() => this.inflight.delete(inflightKey));
+            this.inflight.set(inflightKey, operation);
             const result = await operation;
             if (regenerate) await this.outputs?.setCurrent(requestKey, result.outputId);
             this.#record({ event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'miss', status: 200, bytes: result.data.length, durationMs: Date.now() - startedAt });
@@ -1424,9 +1432,9 @@ export class ImageService {
         }
     }
 
-    async #generateWithFallback(prepared, signal) {
+    async #generateWithFallback(prepared, signal, reportState) {
         try {
-            return await this.#generateOwned(prepared, signal);
+            return await this.#generateOwned(prepared, signal, reportState);
         } catch (error) {
             const code = String(error?.code ?? 'internal_error');
             const routing = prepared.routing;
@@ -1460,7 +1468,7 @@ export class ImageService {
                 code,
             });
             try {
-                return await this.#generateOwned(fallbackPrepared, signal);
+                return await this.#generateOwned(fallbackPrepared, signal, reportState);
             } catch (fallbackError) {
                 fallbackError.imageProvenance = {
                     requestedProfile: prepared.request.profile,
@@ -1472,7 +1480,7 @@ export class ImageService {
         }
     }
 
-    async #generateOwned(prepared, signal) {
+    async #generateOwned(prepared, signal, reportState) {
         const options = {
             fetchImpl: this.fetchImpl,
             maxBytes: Number(this.config.limits?.maxResponseBytes ?? 50 * 1024 * 1024),
@@ -1489,6 +1497,8 @@ export class ImageService {
             case 'comfyui': result = await comfyUiAdapter(prepared.profile, prepared.request, options); break;
             default: throw new PluginError('Unsupported profile type', { status: 500, code: 'config_error' });
         }
+        signal?.throwIfAborted();
+        if (this.outputs) reportState?.('persisting');
         const durable = this.outputs
             ? await this.outputs.set(prepared.key, result, {
                 request: prepared.request,

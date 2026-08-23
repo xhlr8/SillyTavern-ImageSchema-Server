@@ -7,6 +7,10 @@ limits:
   maxResponseBytes: 52428800
   maxConcurrentRequests: 4
 
+# Server-backed generation queue; defaults to one running job globally.
+jobs:
+  concurrency: 1
+
 diagnostics:
   limit: 150
 
