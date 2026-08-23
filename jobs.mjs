@@ -12,10 +12,12 @@ function positiveInteger(value, label) {
 }
 
 function publicError(error) {
-    const code = typeof error?.code === 'string' && error.code ? error.code : 'generation_failed';
-    const message = typeof error?.code === 'string' && typeof error?.message === 'string' && error.message
-        ? error.message : 'Generation job failed';
-    return { code, message };
+    // PluginError instances deliberately carry HTTP-safe codes and messages.
+    // Never surface native coded errors, whose messages may contain file paths.
+    if (error?.name === 'PluginError' && typeof error.code === 'string' && typeof error.message === 'string') {
+        return { code: error.code, message: error.message };
+    }
+    return { code: 'generation_failed', message: 'Generation job failed' };
 }
 
 const clone = value => structuredClone(value);

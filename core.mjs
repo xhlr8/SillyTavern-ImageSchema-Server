@@ -1423,6 +1423,7 @@ export class ImageService {
             const operation = this.#generateWithFallback(prepared, signal, reportState).finally(() => this.inflight.delete(inflightKey));
             this.inflight.set(inflightKey, operation);
             const result = await operation;
+            signal?.throwIfAborted();
             if (regenerate) await this.outputs?.setCurrent(requestKey, result.outputId);
             this.#record({ event: 'generation.complete', ...detail, cache: bypassCache ? 'bypass' : 'miss', status: 200, bytes: result.data.length, durationMs: Date.now() - startedAt });
             return result;
@@ -1510,6 +1511,7 @@ export class ImageService {
                 fallbackReason: prepared.fallbackReason ?? null,
             })
             : { ...result, etag: createHash('sha256').update(result.data).digest('hex'), cached: false };
+        signal?.throwIfAborted();
         // Internal cache is only an accelerator. Failure to populate it must not
         // invalidate a successfully persisted authoritative output.
         if (this.cache) await this.cache.set(prepared.key, durable).catch(() => {});
