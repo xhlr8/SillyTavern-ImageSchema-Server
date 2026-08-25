@@ -58,6 +58,9 @@ test('Comfy workflow validation sanitizes API prompts and verifies binding targe
     assert.deepEqual(validateComfyBindings(bindings, clean), bindings);
     assert.throws(() => validateComfyBindings({ prompt: { node: '99', input: 'text' } }, clean), /does not exist/);
     assert.throws(() => validateComfyBindings({ prompt: { node: '1', input: 'missing' } }, clean), /does not exist/);
+    const stringFunction = validateComfyWorkflow({ 270: { class_type: 'StringFunction|pysssss', inputs: { action: 'append', text_b: '' } } });
+    assert.throws(() => validateComfyBindings({ prompt: { node: '270', input: 'action' } }, stringFunction), /control input/);
+    assert.deepEqual(validateComfyBindings({ prompt: { node: '270', input: 'text_b' } }, stringFunction), { prompt: { node: '270', input: 'text_b' } });
     assert.throws(() => validateComfyWorkflow({ 1: { class_type: 'X', inputs: { constructor: 'pollute' } } }), /unsafe/);
     assert.throws(() => validateComfyWorkflow({ 1: { class_type: 'X', inputs: {}, unexpected: true } }), /unsupported/);
 });

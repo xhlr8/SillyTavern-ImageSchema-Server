@@ -93,6 +93,8 @@ export function validateComfyWorkflow(value, label = 'workflow', invalid = defau
     return workflow;
 }
 
+const PROMPT_CONTROL_INPUT = /^(action|mode|operation|method|behavior|type|device)$/i;
+
 function normalizeBinding(value, role, workflow, label, invalid) {
     if (!isPlainObject(value)) fail(invalid, `${label}.${role} must be an object`);
     for (const key of Object.keys(value)) {
@@ -104,6 +106,9 @@ function normalizeBinding(value, role, workflow, label, invalid) {
     if (!node || node.length > 200 || !Object.hasOwn(workflow, node)) fail(invalid, `${label}.${role}.node does not exist in workflow`);
     if (typeof input !== 'string' || !input || input.length > 500 || FORBIDDEN_KEYS.has(input)) fail(invalid, `${label}.${role}.input is invalid`);
     if (!Object.hasOwn(workflow[node].inputs, input)) fail(invalid, `${label}.${role} targets a workflow input that does not exist`);
+    if (['prompt', 'negative'].includes(role) && PROMPT_CONTROL_INPUT.test(input)) {
+        fail(invalid, `${label}.${role} targets a workflow control input rather than prompt text`);
+    }
     const mode = value.mode ?? 'replace';
     if (!['replace', 'append', 'prepend'].includes(mode)) fail(invalid, `${label}.${role}.mode must be replace, append, or prepend`);
     if (!['prompt', 'negative'].includes(role) && mode !== 'replace') fail(invalid, `${label}.${role}.mode must be replace`);
